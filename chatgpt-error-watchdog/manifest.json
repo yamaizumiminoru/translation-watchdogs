@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT おつかれ Watchdog",
+  "version": "0.1.4",
+  "description": "会話ごとにON。明示的な通信エラー時だけ、Retryまたは労い＋続けてのメッセージで再開を助けます。",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": ["https://chatgpt.com/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "ChatGPT おつかれ Watchdog", "default_popup": "popup.html" },
+  "content_scripts": [{
+    "matches": ["https://chatgpt.com/*"],
+    "js": ["watchdog-core.js", "dom.js", "content.js"],
+    "run_at": "document_idle"
+  }]
+}

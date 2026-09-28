@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChatGPT おつかれ Watchdog</title>
+  <link rel="stylesheet" href="popup.css">
+  <script src="watchdog-core.js" defer></script>
+  <script src="popup.js" defer></script>
+</head>
+<body>
+  <main>
+    <header class="app-header">
+      <div class="app-icon" aria-hidden="true">👏<span>🍵</span></div>
+      <div>
+        <h1>ChatGPT おつかれ Watchdog</h1>
+        <p class="tagline">エラーのときだけ、やさしく続きをお願い</p>
+      </div>
+    </header>
+
+    <section id="status-card" class="status-card" data-tone="neutral" aria-labelledby="status-label">
+      <div class="status-heading"><span class="status-dot" aria-hidden="true"></span><h2 id="status-label">状態を確認中…</h2></div>
+      <p id="status-detail" role="status" aria-live="polite">このタブのWatchdogを確認しています。</p>
+      <p id="recovery-count" class="muted">自動復旧 0 / 10 回</p>
+    </section>
+
+    <button id="toggle" class="primary" type="button" disabled>この会話を見守る 👀</button>
+    <p id="notice" class="notice" role="status" aria-live="polite"></p>
+
+    <details id="settings">
+      <summary>設定</summary>
+      <form id="settings-form">
+        <label for="grace-seconds">エラーが続いてから復旧するまで
+          <span class="input-row"><input id="grace-seconds" type="number" min="5" max="300" step="1" required inputmode="numeric"><span>秒</span></span>
+        </label>
+        <label for="max-recoveries">この会話の自動復旧回数の上限
+          <span class="input-row"><input id="max-recoveries" type="number" min="1" max="50" step="1" required inputmode="numeric"><span>回</span></span>
+        </label>
+        <p class="muted settings-note">設定は全会話で共通です。見守りの開始・終了は会話ごとに選べます。</p>
+        <button id="save" class="secondary" type="submit" disabled>設定を保存</button>
+      </form>
+    </details>
+
+    <aside class="help">
+      <p>通常の返答が終わっただけでは送信しません。入力中・添付あり・応答中は待機します。</p>
+      <p>同じ会話では「翻訳おつかれ Watchdog」と同時に見守らせないでください。</p>
+    </aside>
+    <footer>エラーだけを見守る <span>v0.1.4</span></footer>
+  </main>
+</body>
+</html>

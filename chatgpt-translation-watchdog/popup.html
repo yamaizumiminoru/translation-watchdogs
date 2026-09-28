@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>翻訳おつかれ Watchdog</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div class="mascot" aria-hidden="true">👏🍵</div>
+      <div>
+        <h1>翻訳おつかれ Watchdog</h1>
+        <p>止まったら、やさしく続きをお願いする係</p>
+      </div>
+    </header>
+
+    <section class="status-card" aria-live="polite">
+      <div class="status-row">
+        <span id="status-dot" class="status-dot"></span>
+        <strong id="status-label">確認中…</strong>
+      </div>
+      <p id="status-detail">ChatGPTの状態を読んでいます。</p>
+      <div id="counter" class="counter"></div>
+    </section>
+
+    <section class="actions">
+      <button id="toggle" class="primary" type="button">このスレを見守る</button>
+      <button id="nudge" type="button">今すぐ労って続けて🙏</button>
+      <button id="rollover" class="danger-outline" type="button">新スレへ引き継ぐ↗</button>
+    </section>
+
+    <details>
+      <summary>設定</summary>
+      <label>
+        労い＋再開メッセージ
+        <textarea id="prompt" rows="6"></textarea>
+      </label>
+      <label>
+        完訳時の労いメッセージ
+        <textarea id="completion-prompt" rows="3"></textarea>
+      </label>
+      <label>
+        続行不能エラー時の労いメッセージ
+        <textarea id="terminal-error-prompt" rows="4"></textarea>
+      </label>
+      <div class="grid">
+        <label>
+          最大再開回数
+          <input id="max-nudges" type="number" min="1" max="100">
+        </label>
+        <label>
+          停止確認（秒）
+          <input id="settle-seconds" type="number" min="5" max="300">
+        </label>
+        <label>
+          無変化停止の確認（秒）
+          <input id="silent-stall-seconds" type="number" min="30" max="600">
+        </label>
+        <label>
+          配信タイムアウト復旧（秒）
+          <input id="delivery-timeout-seconds" type="number" min="2" max="60">
+        </label>
+      </div>
+      <label>
+        完了合図
+        <input id="completion-marker" type="text">
+      </label>
+      <label>
+        プロジェクト名
+        <input id="project-name" type="text">
+      </label>
+      <label>
+        永続状態のリポジトリ
+        <input id="repository-url" type="text">
+      </label>
+      <label class="check-row">
+        <input id="rollover-enabled" type="checkbox">
+        容量上限時、同じプロジェクトの新スレへ自動引き継ぎ
+      </label>
+      <label class="check-row">
+        <input id="stop-on-terminal-error" type="checkbox">
+        「エラーで続行不能」と明言したら、労って監視終了
+      </label>
+      <div class="settings-actions">
+        <button id="save" type="button">設定を保存</button>
+        <button id="reset-count" type="button">回数をリセット</button>
+      </div>
+    </details>
+
+    <p id="message" class="message" aria-live="polite"></p>
+  </main>
+  <script src="watchdog-core.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

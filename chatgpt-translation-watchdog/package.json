@@ -1,0 +1,9 @@
+{
+  "name": "chatgpt-translation-watchdog",
+  "version": "0.3.12",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/core.test.cjs",
+    "check": "node --check watchdog-core.js && node --check content.js && node --check background.js && node --check popup.js"
+  }
+}

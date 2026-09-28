@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "翻訳おつかれ Watchdog",
+  "version": "0.3.12",
+  "description": "ChatGPTの翻訳スレを見守り、停止時に労いメッセージで再開し、容量上限時は同じプロジェクトへ引き継ぎます。",
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "翻訳おつかれ Watchdog",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "watchdog-core.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
