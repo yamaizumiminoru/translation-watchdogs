@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT おつかれ Watchdog",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "会話ごとにON。明示的な通信エラー時だけ、Retryまたは労い＋続けてのメッセージで再開を助けます。",
   "permissions": ["storage", "tabs"],
   "host_permissions": ["https://chatgpt.com/*"],

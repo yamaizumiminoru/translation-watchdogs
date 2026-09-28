@@ -105,7 +105,7 @@ test('all conversation URL forms share identity, project home does not arm', () 
   assert.equal(core.route('https://example.org/c/aaa-bbb'), null);
 });
 test('supported errors have appropriate generic prompts with emoji, no project binding', () => {
-  const samples = [['Message delivery timed out. Please try again.', 'timeout'], ['Connection interrupted. Waiting for the complete answer', 'interrupted'], ['Network error', 'network'], ['Something went wrong. Please try again.', 'generic'], ['Thinking failed', 'thinking']];
+  const samples = [['Message delivery timed out. Please try again.', 'timeout'], ['Connection interrupted. Waiting for the complete answer', 'interrupted'], ['Network error', 'network'], ['Something went wrong. Please try again.', 'generic'], ['Error in message stream', 'generic'], ['Thinking failed', 'thinking']];
   for (const [text, kind] of samples) {
     assert.equal(core.classify(text), kind);
     assert.match(core.prompt(kind), /👏🍵/);
@@ -113,7 +113,50 @@ test('supported errors have appropriate generic prompts with emoji, no project b
     assert.doesNotMatch(core.prompt(kind), /翻訳|github|PDF|TRANSLATION/);
   }
   assert.equal(core.classify('Something went wrong. Please try again. を説明します'), null);
+  assert.equal(core.classify('Error in message stream って出た'), null);
   assert.equal(core.classify('Too many requests. Please try again.'), 'blocked');
+});
+test('message-stream error is read only from visible latest-turn error UI', () => {
+  const p = page(turn('user', 1, '作業を続けて') + turn('assistant', 2, '途中', '<div role="alert">Error in message stream</div>'));
+  assert.equal(dom.snapshot(p.doc).error?.kind, 'generic');
+  for (const html of [
+    turn('assistant', 2, 'Error in message stream'),
+    turn('assistant', 2, '途中', '<div hidden role="alert">Error in message stream</div>'),
+    turn('assistant', 2, '途中', '<div role="alert">Error in message stream</div>') + turn('user', 3, 'この表示は？')
+  ]) {
+    p.doc.querySelector('main').innerHTML = html;
+    assert.equal(dom.snapshot(p.doc).error, null);
+  }
+  p.close();
+});
+test('failed user send with a native Retry keeps the original request', () => {
+  const p = page(turn('user', 1, '作業を続けて',
+    '<div><div>Error in message stream</div><button data-testid="regenerate-thread-error-button">Retry</button></div>'));
+  const snap = dom.snapshot(p.doc);
+  assert.equal(snap.error?.kind, 'generic');
+  assert.equal(snap.retryReady, true);
+  assert.equal(core.decide({ ...snap, enabled: true, count: 0, maxRecoveries: 10,
+    stableMs: 5000, graceSeconds: 5 }).action, 'retry');
+  p.close();
+});
+test('message-stream error prompts once, preserving the current task', async () => {
+  const s = worker({ [sessionKey]: { enabled: true, count: 0, attempted: [] } });
+  const p = page(turn('user', 1, 'Watchdogの修正を続けて') +
+    turn('assistant', 2, '途中', '<div role="alert">Error in message stream</div>'), s, true);
+  const sent = [];
+  p.doc.querySelector('[data-testid=send-button]').addEventListener('click', event => {
+    event.preventDefault();
+    const input = p.doc.querySelector('#prompt-textarea');
+    sent.push(input.textContent);
+    p.doc.querySelector('main').insertAdjacentHTML('beforeend', turn('user', 3, input.textContent));
+    input.textContent = '';
+  });
+  await p.drain();
+  await p.tick();
+  await p.tick();
+  assert.deepEqual(sent, [core.prompt('generic')]);
+  assert.equal(s.stored[sessionKey].count, 1);
+  p.close();
 });
 test('stream resume failure is an exact Retry-only error label', () => {
   assert.equal(core.classify('Resume stream unavailable'), 'stream');
