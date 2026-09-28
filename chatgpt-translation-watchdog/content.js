@@ -567,7 +567,9 @@
         (expectedAssistantKey && snap.assistantKey !== expectedAssistantKey)) {
       throw new Error("対象の応答が変わりました。送信せず画面を再確認してください。");
     }
-    if (snap.assistantKey === session.lastHandledAssistantKey) {
+    const manualBaselineOverride = expectedAssistantKey === null && session.nudgeCount === 0 &&
+      ["armed", "settling", "waiting"].includes(session.status);
+    if (snap.assistantKey === session.lastHandledAssistantKey && !manualBaselineOverride) {
       throw new Error("同じ応答への再開依頼はすでに試みました。重複送信しません。");
     }
     if (snap.draftText) throw new Error("入力欄に下書きがあるため、自動送信を見送りました。下書きは変更していません。");

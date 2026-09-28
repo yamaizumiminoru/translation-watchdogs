@@ -214,6 +214,29 @@ test("an unfinished ClientError tool response gets the 180-second recovery windo
   });
 });
 
+test("a manual nudge can resume an old baseline once while automatic duplicate recovery stays blocked", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+  const start = source.indexOf("  async function nudgeNow(");
+  const end = source.indexOf("  async function retryStreamCacheFailure()", start);
+  const session = { nudgeCount: 0, lastHandledAssistantKey: "assistant-old", status: "waiting" };
+  let sends = 0;
+  const context = {
+    route: { kind: "conversation" }, session, config: { maxNudges: 20, prompt: "続けて" },
+    snapshot: () => ({ generating: false, lastTurn: { role: "assistant" },
+      assistantKey: "assistant-old", draftText: "" }),
+    saveSession: async patch => Object.assign(session, patch),
+    submitPrompt: async () => { sends += 1; },
+    statusPayload: () => ({ ok: true })
+  };
+  const nudge = vm.runInNewContext(`${source.slice(start, end)}\nnudgeNow`, context);
+  await assert.rejects(nudge("assistant-old"), /重複送信/);
+  await nudge();
+  assert.equal(sends, 1);
+  assert.equal(session.nudgeCount, 1);
+  await assert.rejects(nudge(), /重複送信/);
+  assert.equal(sends, 1);
+});
+
 test("content monitor executes the verified stop-and-nudge recovery automatically", () => {
   const contentSource = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
   assert.match(
