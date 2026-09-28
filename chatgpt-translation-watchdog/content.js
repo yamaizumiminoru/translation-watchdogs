@@ -373,7 +373,7 @@
     return {
       hasToolActivity: activityButtons.length > 0,
       hasResponseActions,
-      activitySignature
+      activitySignature: core.progressText(activitySignature)
     };
   }
 
@@ -391,7 +391,12 @@
     const thinkingFailed = hasThinkingFailureIndicator(lastTurn, structure.hasResponseActions);
     const analysisFailed = hasAnalysisFailureIndicator(lastTurn, structure.hasResponseActions);
     const assistantKey = core.makeStableTurnKey(lastAssistant);
-    const lastTurnKey = core.makeTurnKey(lastTurn);
+    const lastTurnKey = core.makeTurnKey(lastTurn && {
+      ...lastTurn,
+      text: core.progressText(lastTurn.text)
+    });
+    const unfinishedToolError = lastTurn?.role === "assistant" &&
+      core.hasUnfinishedToolError(lastTurn.text) && !structure.hasResponseActions;
     const deliveryTimedOut = core.hasDeliveryTimeout(statusText);
     const retryButton = findRetryButton(lastTurn);
     const streamCacheRetry = findStreamCacheRetry(lastTurn, retryButton);
@@ -411,6 +416,7 @@
       deliveryTimedOut,
       composerReady,
       hasToolActivity: structure.hasToolActivity,
+      unfinishedToolError,
       analysisFailed,
       hasResponseActions: structure.hasResponseActions
     });
@@ -425,6 +431,7 @@
           deliveryTimedOut ? "delivery-timeout" : "no-delivery-timeout",
           thinkingFailed ? "thinking-failed" : "no-thinking-failed",
           analysisFailed ? "analysis-errored" : "no-analysis-error",
+          unfinishedToolError ? "unfinished-tool-error" : "no-tool-error",
           streamCacheFailure ? "stream-cache-expired" : "no-stream-cache-error",
           streamCacheDraftSafe ? "retry-draft-safe" : "draft-protected",
           retryableSendFailure ? "retryable-send-failure" : "no-retryable-send-failure"
@@ -446,6 +453,7 @@
       streamCacheTurnKey: core.makeStableTurnKey(lastTurn),
       retryTurnKey: core.makeStableTurnKey(lastTurn),
       hasToolActivity: structure.hasToolActivity,
+      unfinishedToolError,
       hasResponseActions: structure.hasResponseActions,
       silentStalled,
       interrupted: core.hasTransientInterruption(statusText),
@@ -798,6 +806,13 @@
       const snap = snapshot();
       const assistantKey = snap.assistantKey;
       const observationKey = snap.observationKey;
+      // Earlier versions marked an already stopped turn as handled when
+      // monitoring was enabled. Reopen only an explicit unfinished tool error
+      // that has never received a nudge, including after an extension update.
+      if (snap.unfinishedToolError && snap.silentStalled &&
+          session.nudgeCount === 0 && assistantKey === session.lastHandledAssistantKey) {
+        await saveSession({ lastHandledAssistantKey: null });
+      }
       let candidateSeenAt = session.candidateSeenAt || 0;
       if (observationKey && observationKey !== session.candidateAssistantKey) {
         candidateSeenAt = Date.now();
@@ -843,6 +858,7 @@
         lastRetriedStreamTurnKey: session.lastRetriedStreamTurnKey,
         composerReady: snap.composerReady,
         hasToolActivity: snap.hasToolActivity,
+        unfinishedToolError: snap.unfinishedToolError,
         hasResponseActions: snap.hasResponseActions,
         silentStalled: snap.silentStalled,
         lastRole: snap.lastTurn?.role,
@@ -962,6 +978,19 @@
         return;
       }
 
+      if (decision.reason === "assistant_turn_already_handled" ||
+          decision.reason === "awaiting_assistant" ||
+          decision.reason === "no_assistant_turn") {
+        const nextStatus = "waiting";
+        const nextDetail = decision.reason === "assistant_turn_already_handled"
+          ? "監視開始前からある応答は処理済みです。次の応答を待っています。"
+          : "回答の到着を待っています。画面に応答があっても続く場合は、ChatGPTの表示を確認してください。";
+        if (session.status !== nextStatus || session.detail !== nextDetail) {
+          await saveSession({ status: nextStatus, detail: nextDetail });
+        }
+        return;
+      }
+
       if (snap.generating) {
         const nextStatus = snap.interrupted ? "interrupted" : "generating";
         const nextDetail = snap.interrupted
@@ -1015,6 +1044,7 @@
         streamCacheFailure: snap.streamCacheFailure,
         silentStalled: snap.silentStalled,
         hasToolActivity: snap.hasToolActivity,
+        unfinishedToolError: snap.unfinishedToolError,
         hasResponseActions: snap.hasResponseActions,
         capacityLimited: snap.capacityLimited,
         completed: snap.completed,

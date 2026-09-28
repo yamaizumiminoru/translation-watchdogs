@@ -170,6 +170,20 @@
     return (hash >>> 0).toString(16).padStart(8, "0");
   }
 
+  // ChatGPT updates elapsed-time labels while a tool is running. A changing
+  // clock is not new output and must not restart the inactivity timer.
+  function progressText(text) {
+    return String(text || "").replace(
+      /(^|\n)(\s*Worked for\s+)\d+(?:h\s*)?\d*(?:m\s*)?\d*s\b/gi,
+      "$1$2<elapsed>"
+    );
+  }
+
+  function hasUnfinishedToolError(text) {
+    return /Encountered exception:\s*<class\s+['"][^'">]*\bClientError['"]>\.?\s*$/i
+      .test(String(text || "").trim());
+  }
+
   function makeTurnKey(turn) {
     if (!turn) return null;
     const id = String(turn.id || "unknown");
@@ -258,7 +272,7 @@
       state.deliveryTimedOut !== true &&
       state.composerReady === true &&
       state.hasResponseActions === false &&
-      (state.hasToolActivity === true || state.analysisFailed === true);
+      (state.hasToolActivity === true || state.analysisFailed === true || state.unfinishedToolError === true);
   }
 
   function decideAction(input) {
@@ -296,7 +310,7 @@
         ? state.silentStallMs
         : DEFAULTS.silentStallSeconds * 1000;
       const frozenToolResponse = state.lastRole === "assistant" &&
-        state.hasToolActivity === true &&
+        (state.hasToolActivity === true || state.unfinishedToolError === true) &&
         state.composerReady === true;
       if (stableForMs >= stuckTimeoutMs && (state.deliveryTimedOut || frozenToolResponse)) {
         if (state.nudgeCount >= state.maxNudges) {
@@ -383,6 +397,8 @@
     normalizeConfig,
     parseChatGPTLocation,
     fnv1a,
+    progressText,
+    hasUnfinishedToolError,
     makeTurnKey,
     makeStableTurnKey,
     normalizeTurnRole,

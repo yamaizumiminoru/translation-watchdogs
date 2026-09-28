@@ -186,6 +186,34 @@ test("automatically recovers when a tool response stays generating without any v
   });
 });
 
+test("elapsed tool clocks do not reset the no-progress timer but new output does", () => {
+  const earlier = "Worked for 14m 40s\nEncountered exception: <class 'caas.internal.errors.ClientError'>.";
+  const later = "Worked for 14m 43s\nEncountered exception: <class 'caas.internal.errors.ClientError'>.";
+  const newOutput = `${later}\nprint('next')`;
+  const key = text => core.makeTurnKey({ id: "assistant-1", text: core.progressText(text) });
+  assert.equal(key(earlier), key(later));
+  assert.notEqual(key(later), key(newOutput));
+});
+
+test("an unfinished ClientError tool response gets the 180-second recovery window", () => {
+  const text = "Worked for 14m 40s\nEncountered exception: <class 'caas.internal.errors.ClientError'>.";
+  assert.equal(core.hasUnfinishedToolError(text), true);
+  assert.equal(core.hasUnfinishedToolError(`${text}\n訳出を再開します。`), false);
+  assert.equal(core.isSilentStallCandidate({
+    lastRole: "assistant", generating: false, composerReady: true,
+    hasResponseActions: false, hasToolActivity: false, unfinishedToolError: true
+  }), true);
+  const state = {
+    enabled: true, generating: true, lastRole: "assistant", composerReady: true,
+    hasToolActivity: false, unfinishedToolError: true,
+    stableForMs: 180000, silentStallMs: 180000,
+    nudgeCount: 0, maxNudges: 20
+  };
+  assert.deepEqual(core.decideAction(state), {
+    action: "recover_stuck", reason: "generation_stuck_no_change"
+  });
+});
+
 test("content monitor executes the verified stop-and-nudge recovery automatically", () => {
   const contentSource = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
   assert.match(
