@@ -34,6 +34,7 @@
     ["interrupted", /^Connection interrupted\.?\s*(?:Waiting for the complete answer\.?)?$/i],
     ["network", /^(?:A network error occurred|Network error)\.?\s*(?:Please try again\.?)?$/i],
     ["generic", /^Something went wrong\.?\s*(?:Please try again\.?)?$/i],
+    ["generic", /^Error in message stream\.?$/i],
     ["thinking", /^Thinking failed\.?$/i],
     ["stream", /^(?:Stream cache expired|Resume stream unavailable)\.?$/i],
     ["generic", /^There was an error generating a response\.?\s*(?:Please try again\.?)?$/i],
