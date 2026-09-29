@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-translation-watchdog",
-  "version": "0.3.13",
+  "version": "0.3.14",
   "private": true,
   "scripts": {
     "test": "node --test tests/core.test.cjs",

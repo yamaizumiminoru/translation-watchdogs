@@ -117,6 +117,35 @@ test("collects separate stable user and assistant identities inside one shared t
   assert.equal(collect()[1].id, turns[1].id);
 });
 
+test("recovers an unwrapped Analysis errored control only after the latest user turn", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+  const start = source.indexOf("  function findUnwrappedAnalysisFailure(");
+  const end = source.indexOf("  function findGeneratingButton()", start);
+  assert.ok(start >= 0 && end > start);
+  const button = {
+    innerText: "Analysis errored",
+    closest: () => null,
+    parentElement: { innerText: "Analysis errored", querySelectorAll: () => [button] }
+  };
+  const lastTurn = { role: "user", id: "user-17", node: {
+    contains: () => false,
+    compareDocumentPosition: () => 4
+  } };
+  const context = { core, Node: { DOCUMENT_POSITION_FOLLOWING: 4 },
+    document: { querySelectorAll: () => [button] }, visible: () => true,
+    elementText: node => node.innerText };
+  const find = vm.runInNewContext(`${source.slice(start, end)}\nfindUnwrappedAnalysisFailure`, context);
+  const found = find(lastTurn);
+  assert.equal(found.role, "assistant");
+  assert.equal(found.id, "unwrapped-analysis-error:user-17");
+  assert.equal(core.hasAnalysisErrorLabel(found.text), true);
+  lastTurn.node.compareDocumentPosition = () => 2;
+  assert.equal(find(lastTurn), null);
+  lastTurn.node.compareDocumentPosition = () => 4;
+  button.closest = () => ({ className: "markdown" });
+  assert.equal(find(lastTurn), null);
+});
+
 test("failed-send Retry is keyed to a stable turn ID rather than changing error text", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
   assert.match(source, /retryTurnKey: core\.makeStableTurnKey\(lastTurn\)/);

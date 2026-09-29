@@ -219,6 +219,29 @@
       .filter(turn => turn.role === "assistant" || turn.role === "user");
   }
 
+  function findUnwrappedAnalysisFailure(lastTurn) {
+    if (lastTurn?.role !== "user" || !lastTurn.node?.compareDocumentPosition) return null;
+    // A failed tool run may leave only the error control, without an assistant
+    // message node. Accept it only after the latest user turn, never from an
+    // older response or from quoted text inside a message.
+    const buttons = Array.from(document.querySelectorAll("main button")).filter(button =>
+      visible(button) &&
+      core.hasAnalysisErrorLabel(elementText(button)) &&
+      !button.closest('.markdown, .whitespace-pre-wrap, pre, code, blockquote, [data-user-message-bubble]') &&
+      !lastTurn.node.contains(button) &&
+      Boolean(lastTurn.node.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING)
+    );
+    const button = buttons[buttons.length - 1];
+    if (!button) return null;
+    const node = button.parentElement || button;
+    return {
+      id: `unwrapped-analysis-error:${lastTurn.id}`,
+      role: "assistant",
+      text: elementText(node),
+      node
+    };
+  }
+
   function findGeneratingButton() {
     const selectors = [
       '[data-testid="stop-button"]',
@@ -379,6 +402,8 @@
 
   function snapshot() {
     const turns = collectTurns();
+    const unwrappedFailure = findUnwrappedAnalysisFailure(turns[turns.length - 1]);
+    if (unwrappedFailure) turns.push(unwrappedFailure);
     const lastTurn = turns[turns.length - 1] || null;
     const lastAssistant = [...turns].reverse().find(turn => turn.role === "assistant") || null;
     const lastUser = [...turns].reverse().find(turn => turn.role === "user") || null;
