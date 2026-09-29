@@ -14,6 +14,15 @@
   const DEFAULT_TERMINAL_ERROR_PROMPT =
     "ここまで進めてくれて本当にありがとう、おつかれさまでした👏🍵　エラーでこれ以上続けられない件、了解です。保存済みの状態はそのままにして、ここで止めます🙏";
 
+  function buildRuntimeRecoveryPrompt(input) {
+    const config = normalizeConfig(input?.config);
+    return "ここまでおつかれさまです👏🍵　直前のツール実行が ClientError または Analysis errored で止まりました。" +
+      "まず /mnt/data の存在確認だけを一度試してください。成功した場合のみ、" + config.repositoryUrl +
+      " の main にある保存済みの manifest・checkpoint を再取得し、小さな単位で翻訳を続けてください。" +
+      "同じツールエラーが再発したら実行を繰り返さず、GitHubに保存済みの状態と次の開始点を文章で報告してください。" +
+      "実際に全作業が完了した場合だけ " + config.completionMarker + " を付けてください。";
+  }
+
   const DEFAULTS = Object.freeze({
     prompt: DEFAULT_PROMPT,
     completionPrompt: DEFAULT_COMPLETION_PROMPT,
@@ -313,6 +322,9 @@
         (state.hasToolActivity === true || state.unfinishedToolError === true) &&
         state.composerReady === true;
       if (stableForMs >= stuckTimeoutMs && (state.deliveryTimedOut || frozenToolResponse)) {
+        if (state.runtimeFailure && state.runtimeFailureStreak >= 2) {
+          return repeatedRuntimeFailureAction(state, true);
+        }
         if (state.nudgeCount >= state.maxNudges) {
           return { action: "pause", reason: "nudge_limit" };
         }
@@ -336,6 +348,10 @@
     if (state.completed) return { action: "complete", reason: "completion_marker" };
     if (state.lastRole !== "assistant") return { action: "wait", reason: "awaiting_assistant" };
     if (!state.assistantKey) return { action: "wait", reason: "no_assistant_turn" };
+    if (state.runtimeFailure && state.runtimeFailureStreak >= 2) {
+      if (state.stableForMs < state.silentStallMs) return { action: "wait", reason: "settling" };
+      return repeatedRuntimeFailureAction(state, false);
+    }
     if (state.assistantKey === state.lastHandledAssistantKey) {
       return { action: "wait", reason: "assistant_turn_already_handled" };
     }
@@ -363,6 +379,16 @@
     };
   }
 
+  function repeatedRuntimeFailureAction(state, generating) {
+    if (state.draftText) return { action: "pause", reason: "runtime_failure_draft_protected" };
+    if (!state.rolloverEnabled || !state.projectSlug || state.runtimeRolloverCount >= 1) {
+      return { action: "pause", reason: "repeated_tool_runtime_failure" };
+    }
+    return generating
+      ? { action: "stop_for_runtime_rollover", reason: "repeated_tool_runtime_failure" }
+      : { action: "rollover", reason: "repeated_tool_runtime_failure" };
+  }
+
   function tail(text, limit) {
     const source = String(text || "").trim();
     if (source.length <= limit) return source;
@@ -375,12 +401,21 @@
     const sourceUrl = String(value.sourceUrl || "").trim();
     const userTail = tail(value.lastUserText, 2500);
     const assistantTail = tail(value.lastAssistantText, 6000);
+    const reason = String(value.reason || "capacity");
+    const intro = reason === "capacity"
+      ? "前スレが容量上限に達したため"
+      : reason === "tool_runtime_failure"
+        ? "前スレのツール環境で ClientError / Analysis errored が連続したため"
+        : "前スレから引き継ぐため";
     const parts = [
-      "前スレが容量上限に達したため、同じ『" + config.projectName + "』プロジェクト内での続きです。おつかれさまです👏🍵",
+      intro + "、同じ『" + config.projectName + "』プロジェクト内での続きです。おつかれさまです👏🍵",
       "永続状態のリポジトリは " + config.repositoryUrl + " です。main の該当 projects/<slug>/ にある manifest・checkpoint・chunk inventory・QA・manuscript をあらためて取得し、記録された Next starting point から翻訳を再開してください。output は生成物なので直接編集しないでください。",
       "原典の権威はこのChatGPTプロジェクトにアップロードされたPDFです。構造が不確かな箇所はOCRだけで確定せず、ページ画像を確認してください。前スレの記憶だけで進捗や本文を推測しないでください。",
       "再開後は、作業を可能なところまで進めて保存してください。翻訳がすべて完了したときだけ、回答末尾に " + config.completionMarker + " と付けてください。"
     ];
+    if (reason === "tool_runtime_failure") {
+      parts.push("まず /mnt/data の存在確認だけを一度試してください。ツールが使える場合のみ保存済みの続きへ進み、同じエラーなら再試行を繰り返さず、保存済み状態と次の開始点を文章で報告してください。前スレの未保存作業を完了扱いにしないでください。");
+    }
     if (sourceUrl) parts.push(`引き継ぎ元スレ: ${sourceUrl}`);
     if (userTail) parts.push(`前スレ末尾のユーザーメッセージ抜粋:\n---\n${userTail}\n---`);
     if (assistantTail) parts.push(`前スレ末尾の応答抜粋:\n---\n${assistantTail}\n---`);
@@ -393,6 +428,7 @@
     DEFAULT_PROMPT,
     DEFAULT_COMPLETION_PROMPT,
     DEFAULT_TERMINAL_ERROR_PROMPT,
+    buildRuntimeRecoveryPrompt,
     DEFAULT_REPOSITORY_URL,
     normalizeConfig,
     parseChatGPTLocation,

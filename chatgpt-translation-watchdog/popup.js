@@ -171,7 +171,7 @@
 
   elements.rollover.addEventListener("click", async () => {
     const accepted = confirm(
-      "現在のスレを容量上限扱いにして、同じ『翻訳』プロジェクトの新しいスレへ引き継ぎメッセージを送ります。よろしいですか？"
+      "同じ『翻訳』プロジェクトの新しいスレへ引き継ぎメッセージを送ります。よろしいですか？"
     );
     if (!accepted) return;
     try {

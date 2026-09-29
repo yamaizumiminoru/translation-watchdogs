@@ -446,7 +446,7 @@ test("recovery latches the stable assistant turn before send or Retry", () => {
     core.makeTurnKey({ id: "assistant-1", text: "one two" }));
   const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
   const nudge = source.slice(source.indexOf("async function nudgeNow"), source.indexOf("async function retryStreamCacheFailure"));
-  assert.ok(nudge.indexOf("lastHandledAssistantKey: snap.assistantKey") < nudge.indexOf("await submitPrompt(config.prompt)"));
+  assert.ok(nudge.indexOf("lastHandledAssistantKey: snap.assistantKey") < nudge.indexOf("await submitPrompt(snap.runtimeFailure"));
   const retry = source.slice(source.indexOf("async function retryStreamCacheFailure"), source.indexOf("async function recoverStuckResponse"));
   assert.ok(retry.indexOf("lastRetriedStreamTurnKey: snap.streamCacheTurnKey") < retry.indexOf("retryButton.click()"));
 });
@@ -718,4 +718,58 @@ test("rollover prompt names the project, source, safeguards, and emoji", () => {
   assert.match(prompt, /C036まで保存済み/);
   assert.match(prompt, /👏🍵/);
   assert.match(prompt, /🙏/);
+});
+
+test("repeated runtime errors recover once, roll over once, then pause", () => {
+  const base = {
+    enabled: true, generating: false, lastRole: "assistant",
+    assistantKey: "failed-turn-2", lastHandledAssistantKey: "failed-turn-1",
+    runtimeFailure: true, runtimeFailureStreak: 2, runtimeRolloverCount: 0,
+    rolloverEnabled: true, projectSlug: "g-p-translation",
+    silentStallMs: 180000, stableForMs: 179999,
+    nudgeCount: 1, maxNudges: 100
+  };
+  assert.deepEqual(core.decideAction(base), { action: "wait", reason: "settling" });
+  assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000 }),
+    { action: "rollover", reason: "repeated_tool_runtime_failure" });
+  assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000,
+    runtimeRolloverCount: 1 }),
+  { action: "pause", reason: "repeated_tool_runtime_failure" });
+  assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000,
+    draftText: "編集中" }),
+  { action: "pause", reason: "runtime_failure_draft_protected" });
+  assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000,
+    projectSlug: null }),
+  { action: "pause", reason: "repeated_tool_runtime_failure" });
+  assert.deepEqual(core.decideAction({ ...base, runtimeFailureStreak: 1,
+    stableForMs: 180000 }),
+  { action: "nudge", reason: "assistant_stopped" });
+});
+
+test("a stuck generating runtime error must stop before rollover", () => {
+  const base = {
+    enabled: true, generating: true, lastRole: "assistant",
+    assistantKey: "failed-turn-2", composerReady: true,
+    unfinishedToolError: true, runtimeFailure: true,
+    runtimeFailureStreak: 2, runtimeRolloverCount: 0,
+    rolloverEnabled: true, projectSlug: "g-p-translation",
+    silentStallMs: 180000, stableForMs: 180000,
+    nudgeCount: 1, maxNudges: 100
+  };
+  assert.deepEqual(core.decideAction(base),
+    { action: "stop_for_runtime_rollover", reason: "repeated_tool_runtime_failure" });
+  assert.deepEqual(core.decideAction({ ...base, draftText: "編集中" }),
+    { action: "pause", reason: "runtime_failure_draft_protected" });
+});
+
+test("runtime recovery and handoff prompts do not claim a capacity limit", () => {
+  const config = { projectName: "翻訳", repositoryUrl: "https://github.com/example/translations" };
+  const recovery = core.buildRuntimeRecoveryPrompt({ config });
+  assert.match(recovery, /\/mnt\/data の存在確認だけを一度/);
+  assert.match(recovery, /再発したら実行を繰り返さず/);
+  assert.match(recovery, /github\.com\/example\/translations/);
+  const handoff = core.buildRolloverPrompt({ config, reason: "tool_runtime_failure" });
+  assert.match(handoff, /ClientError \/ Analysis errored が連続/);
+  assert.match(handoff, /同じエラーなら再試行を繰り返さず/);
+  assert.doesNotMatch(handoff, /容量上限に達した/);
 });
