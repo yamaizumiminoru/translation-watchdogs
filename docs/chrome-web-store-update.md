@@ -4,7 +4,7 @@
 
 ## 将来の更新をChromeだけで行う手順
 
-1. `dist/chatgpt-translation-watchdog-webstore-0.3.15.zip` をChrome Web Store Developer Dashboardにアップロードし、「非公開リンク（Unlisted）」または必要な配布範囲で審査・公開します。このストア用ZIPは直下に`manifest.json`があります。初回は開発者アカウントとストア掲載情報が必要です。
+1. `dist/chatgpt-translation-watchdog-webstore-0.3.15.zip` をChrome Web Store Developer Dashboardにアップロードし、「非公開リンク（Unlisted）」または必要な配布範囲で審査・公開します。このストア用ZIPは直下に`manifest.json`と拡張アイコンがあります。初回は開発者アカウント、掲載情報、実際の拡張画面のスクリーンショット等が必要です。
 2. 公開されたWeb StoreのURLから**一度だけ**配布版をインストールします。ローカル版と配布版は別の拡張として並ぶことがあるため、同じ翻訳スレを二重監視しないよう、ローカル版をOFFにしてから配布版で監視をONにします。設定・監視状態は拡張ごとのローカルストレージにあるため、配布版で設定を確認してください。
 3. 次回以降は、新版のZIPを**同じWeb Storeアイテム**に提出・公開するとChromeが更新します。すぐ確認したい場合は `chrome://extensions` でデベロッパーモードをONにし、上部の「更新」を押します。content scriptが新しくなるよう翻訳タブを再読み込みします。
 

@@ -589,7 +589,7 @@
     return statusPayload();
   }
 
-  async function nudgeNow(expectedAssistantKey = null) {
+  async function nudgeNow(expectedAssistantKey = null, forceRuntimeRecovery = false) {
     if (route.kind !== "conversation") throw new Error("会話ページで実行してください。");
     const snap = snapshot();
     if (snap.generating) throw new Error("まだ応答中です。完全に止まってから実行してください。");
@@ -604,7 +604,7 @@
     }
     if (snap.draftText) throw new Error("入力欄に下書きがあるため、自動送信を見送りました。下書きは変更していません。");
     if (session.nudgeCount >= config.maxNudges) throw new Error("再開回数の上限です。回数をリセットしてください。");
-    if (snap.runtimeFailure && session.runtimeFailureStreak >= 2) {
+    if ((snap.runtimeFailure || forceRuntimeRecovery) && session.runtimeFailureStreak >= 2) {
       throw new Error("ツール環境が連続して失敗しています。再開依頼を重ねず、新スレへの引き継ぎ状況を確認してください。");
     }
     // Claim before clicking Send: an uncertain UI acknowledgement must never
@@ -617,7 +617,7 @@
       status: "sending",
       detail: "同じ応答への重複送信を防ぎながら再開依頼を送っています…"
     });
-    await submitPrompt(snap.runtimeFailure
+    await submitPrompt(snap.runtimeFailure || forceRuntimeRecovery
       ? core.buildRuntimeRecoveryPrompt({ config })
       : config.prompt);
     await saveSession({
@@ -678,6 +678,7 @@
     }
 
     const snap = snapshot();
+    const runtimeFailureBeforeStop = snap.runtimeFailure;
     const stopButton = findGeneratingButton();
     if (!stopButton) {
       throw new Error("固着状態が変わりました。現在の画面を再確認してください。");
@@ -689,7 +690,7 @@
       throw new Error("ChatGPTの停止を確認できませんでした。メッセージは送っていません。");
     }
 
-    await nudgeNow();
+    await nudgeNow(null, runtimeFailureBeforeStop);
     return statusPayload();
   }
 

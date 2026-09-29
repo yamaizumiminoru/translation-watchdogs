@@ -3,6 +3,11 @@
   "name": "翻訳おつかれ Watchdog",
   "version": "0.3.15",
   "description": "ChatGPTの翻訳スレを見守り、停止時に労いメッセージで再開し、容量上限時は同じプロジェクトへ引き継ぎます。",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": [
     "storage",
     "tabs"
@@ -15,6 +20,7 @@
   },
   "action": {
     "default_title": "翻訳おつかれ Watchdog",
+    "default_icon": "icons/icon48.png",
     "default_popup": "popup.html"
   },
   "content_scripts": [

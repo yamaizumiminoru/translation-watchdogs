@@ -762,6 +762,26 @@ test("a stuck generating runtime error must stop before rollover", () => {
     { action: "pause", reason: "runtime_failure_draft_protected" });
 });
 
+test("a stopped first ClientError keeps its diagnostic recovery prompt", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+  const start = source.indexOf("  async function recoverStuckResponse(");
+  const end = source.indexOf("  async function retryFailedSubmission(", start);
+  let generating = true;
+  let recoveryFlag = null;
+  const context = {
+    route: { kind: "conversation" }, session: { status: "stuck_timeout", nudgeCount: 0 },
+    config: { silentStallSeconds: 180, maxNudges: 20 },
+    snapshot: () => ({ runtimeFailure: generating }),
+    findGeneratingButton: () => generating ? { click: () => { generating = false; } } : null,
+    waitFor: async predicate => predicate(),
+    nudgeNow: async (_key, forceRuntimeRecovery) => { recoveryFlag = forceRuntimeRecovery; },
+    statusPayload: () => ({ ok: true })
+  };
+  const recover = vm.runInNewContext(`${source.slice(start, end)}\nrecoverStuckResponse`, context);
+  await recover();
+  assert.equal(recoveryFlag, true);
+});
+
 test("runtime recovery and handoff prompts do not claim a capacity limit", () => {
   const config = { projectName: "翻訳", repositoryUrl: "https://github.com/example/translations" };
   const recovery = core.buildRuntimeRecoveryPrompt({ config });
