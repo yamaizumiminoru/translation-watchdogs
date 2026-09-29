@@ -793,3 +793,20 @@ test("runtime recovery and handoff prompts do not claim a capacity limit", () =>
   assert.match(handoff, /同じエラーなら再試行を繰り返さず/);
   assert.doesNotMatch(handoff, /容量上限に達した/);
 });
+
+test("a final report that tool calls cannot continue rolls over once", () => {
+  const report = "また ClientError になった。なので、ここではこれ以上ツール実行を繰り返さず止めるね。";
+  assert.equal(core.hasToolRuntimeTerminalReport(report), true);
+  assert.equal(core.hasToolRuntimeTerminalReport("ClientError を直したので続けます。"), false);
+  const base = {
+    enabled: true, generating: false, lastRole: "assistant",
+    assistantKey: "terminal-report", lastHandledAssistantKey: "previous",
+    runtimeTerminalFailure: true, terminalErrorBlocked: true,
+    runtimeRolloverCount: 0, rolloverEnabled: true,
+    projectSlug: "g-p-translation", stableForMs: 20000, settleMs: 20000
+  };
+  assert.deepEqual(core.decideAction(base),
+    { action: "rollover", reason: "repeated_tool_runtime_failure" });
+  assert.deepEqual(core.decideAction({ ...base, runtimeRolloverCount: 1 }),
+    { action: "pause", reason: "repeated_tool_runtime_failure" });
+});

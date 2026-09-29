@@ -493,6 +493,8 @@
       retryableSendFailure,
       capacityLimited: core.hasCapacityLimit(statusText),
       terminalErrorBlocked: core.hasTerminalErrorBlocker(lastAssistant?.text),
+      runtimeTerminalFailure: structure.hasResponseActions &&
+        core.hasToolRuntimeTerminalReport(lastAssistant?.text),
       completed: core.hasCompletionMarker(lastAssistant?.text, config.completionMarker)
     };
   }
@@ -860,7 +862,7 @@
           runtimeFailureTurnKey: assistantKey
         });
       } else if (snap.lastTurn?.role === "assistant" && snap.hasResponseActions &&
-                 !snap.runtimeFailure && session.runtimeFailureStreak) {
+                 !snap.runtimeFailure && !snap.runtimeTerminalFailure && session.runtimeFailureStreak) {
         await saveSession({ runtimeFailureStreak: 0, runtimeFailureTurnKey: null });
       }
       // Earlier versions marked an already stopped turn as handled when
@@ -907,6 +909,7 @@
         thinkingFailed: snap.thinkingFailed,
         analysisFailed: snap.analysisFailed,
         runtimeFailure: snap.runtimeFailure,
+        runtimeTerminalFailure: snap.runtimeTerminalFailure,
         runtimeFailureStreak: session.runtimeFailureStreak,
         runtimeRolloverCount: session.runtimeRolloverCount,
         draftText: snap.draftText,
@@ -1124,6 +1127,7 @@
         hasToolActivity: snap.hasToolActivity,
         unfinishedToolError: snap.unfinishedToolError,
         runtimeFailure: snap.runtimeFailure,
+        runtimeTerminalFailure: snap.runtimeTerminalFailure,
         hasResponseActions: snap.hasResponseActions,
         capacityLimited: snap.capacityLimited,
         completed: snap.completed,

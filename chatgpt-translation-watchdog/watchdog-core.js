@@ -269,6 +269,13 @@
     return TERMINAL_ERROR_PATTERNS.some(pattern => pattern.test(source));
   }
 
+  function hasToolRuntimeTerminalReport(text) {
+    const source = String(text || "");
+    return /\bClientError\b|\bAnalysis errored\b|\/mnt\/data/i.test(source) &&
+      (hasTerminalErrorBlocker(source) ||
+        /(?:これ以上|今回は|ここでは).{0,80}(?:止めます|止める(?:ね)?|停止します|停止する)/s.test(source));
+  }
+
   function isExtensionContextInvalidated(error) {
     const message = String(error?.message || error || "");
     return /extension context invalidated/i.test(message);
@@ -354,6 +361,10 @@
     }
     if (state.assistantKey === state.lastHandledAssistantKey) {
       return { action: "wait", reason: "assistant_turn_already_handled" };
+    }
+    if (state.runtimeTerminalFailure) {
+      if (state.stableForMs < state.settleMs) return { action: "wait", reason: "settling" };
+      return repeatedRuntimeFailureAction(state, false);
     }
     const requiredSettleMs = state.deliveryTimedOut || state.thinkingFailed
       ? state.deliveryTimeoutMs
@@ -448,6 +459,7 @@
     hasAnalysisErrorLabel,
     hasRetryableSendFailure,
     hasTerminalErrorBlocker,
+    hasToolRuntimeTerminalReport,
     isExtensionContextInvalidated,
     isSilentStallCandidate,
     decideAction,
