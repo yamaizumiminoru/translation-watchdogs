@@ -80,6 +80,9 @@
       enabled: false,
       nudgeCount: 0,
       rolloverCount: 0,
+      runtimeFailureStreak: 0,
+      runtimeFailureTurnKey: null,
+      runtimeRolloverCount: 0,
       completionThanksSent: false,
       terminalErrorThanksSent: false,
       lastRetriedTurnKey: null,
@@ -217,6 +220,29 @@
         node: node.closest('[data-testid^="conversation-turn-"]') || node
       }))
       .filter(turn => turn.role === "assistant" || turn.role === "user");
+  }
+
+  function findUnwrappedAnalysisFailure(lastTurn) {
+    if (lastTurn?.role !== "user" || !lastTurn.node?.compareDocumentPosition) return null;
+    // A failed tool run may leave only the error control, without an assistant
+    // message node. Accept it only after the latest user turn, never from an
+    // older response or from quoted text inside a message.
+    const buttons = Array.from(document.querySelectorAll("main button")).filter(button =>
+      visible(button) &&
+      core.hasAnalysisErrorLabel(elementText(button)) &&
+      !button.closest('.markdown, .whitespace-pre-wrap, pre, code, blockquote, [data-user-message-bubble]') &&
+      !lastTurn.node.contains(button) &&
+      Boolean(lastTurn.node.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING)
+    );
+    const button = buttons[buttons.length - 1];
+    if (!button) return null;
+    const node = button.parentElement || button;
+    return {
+      id: `unwrapped-analysis-error:${lastTurn.id}`,
+      role: "assistant",
+      text: elementText(node),
+      node
+    };
   }
 
   function findGeneratingButton() {
@@ -373,12 +399,14 @@
     return {
       hasToolActivity: activityButtons.length > 0,
       hasResponseActions,
-      activitySignature
+      activitySignature: core.progressText(activitySignature)
     };
   }
 
   function snapshot() {
     const turns = collectTurns();
+    const unwrappedFailure = findUnwrappedAnalysisFailure(turns[turns.length - 1]);
+    if (unwrappedFailure) turns.push(unwrappedFailure);
     const lastTurn = turns[turns.length - 1] || null;
     const lastAssistant = [...turns].reverse().find(turn => turn.role === "assistant") || null;
     const lastUser = [...turns].reverse().find(turn => turn.role === "user") || null;
@@ -391,7 +419,13 @@
     const thinkingFailed = hasThinkingFailureIndicator(lastTurn, structure.hasResponseActions);
     const analysisFailed = hasAnalysisFailureIndicator(lastTurn, structure.hasResponseActions);
     const assistantKey = core.makeStableTurnKey(lastAssistant);
-    const lastTurnKey = core.makeTurnKey(lastTurn);
+    const lastTurnKey = core.makeTurnKey(lastTurn && {
+      ...lastTurn,
+      text: core.progressText(lastTurn.text)
+    });
+    const unfinishedToolError = lastTurn?.role === "assistant" &&
+      core.hasUnfinishedToolError(lastTurn.text) && !structure.hasResponseActions;
+    const runtimeFailure = Boolean(unfinishedToolError || analysisFailed);
     const deliveryTimedOut = core.hasDeliveryTimeout(statusText);
     const retryButton = findRetryButton(lastTurn);
     const streamCacheRetry = findStreamCacheRetry(lastTurn, retryButton);
@@ -411,6 +445,8 @@
       deliveryTimedOut,
       composerReady,
       hasToolActivity: structure.hasToolActivity,
+      unfinishedToolError,
+      runtimeFailure,
       analysisFailed,
       hasResponseActions: structure.hasResponseActions
     });
@@ -425,6 +461,7 @@
           deliveryTimedOut ? "delivery-timeout" : "no-delivery-timeout",
           thinkingFailed ? "thinking-failed" : "no-thinking-failed",
           analysisFailed ? "analysis-errored" : "no-analysis-error",
+          unfinishedToolError ? "unfinished-tool-error" : "no-tool-error",
           streamCacheFailure ? "stream-cache-expired" : "no-stream-cache-error",
           streamCacheDraftSafe ? "retry-draft-safe" : "draft-protected",
           retryableSendFailure ? "retryable-send-failure" : "no-retryable-send-failure"
@@ -446,6 +483,7 @@
       streamCacheTurnKey: core.makeStableTurnKey(lastTurn),
       retryTurnKey: core.makeStableTurnKey(lastTurn),
       hasToolActivity: structure.hasToolActivity,
+      unfinishedToolError,
       hasResponseActions: structure.hasResponseActions,
       silentStalled,
       interrupted: core.hasTransientInterruption(statusText),
@@ -455,6 +493,8 @@
       retryableSendFailure,
       capacityLimited: core.hasCapacityLimit(statusText),
       terminalErrorBlocked: core.hasTerminalErrorBlocker(lastAssistant?.text),
+      runtimeTerminalFailure: structure.hasResponseActions &&
+        core.hasToolRuntimeTerminalReport(lastAssistant?.text),
       completed: core.hasCompletionMarker(lastAssistant?.text, config.completionMarker)
     };
   }
@@ -551,7 +591,7 @@
     return statusPayload();
   }
 
-  async function nudgeNow(expectedAssistantKey = null) {
+  async function nudgeNow(expectedAssistantKey = null, forceRuntimeRecovery = false) {
     if (route.kind !== "conversation") throw new Error("会話ページで実行してください。");
     const snap = snapshot();
     if (snap.generating) throw new Error("まだ応答中です。完全に止まってから実行してください。");
@@ -559,11 +599,16 @@
         (expectedAssistantKey && snap.assistantKey !== expectedAssistantKey)) {
       throw new Error("対象の応答が変わりました。送信せず画面を再確認してください。");
     }
-    if (snap.assistantKey === session.lastHandledAssistantKey) {
+    const manualBaselineOverride = expectedAssistantKey === null && session.nudgeCount === 0 &&
+      ["armed", "settling", "waiting"].includes(session.status);
+    if (snap.assistantKey === session.lastHandledAssistantKey && !manualBaselineOverride) {
       throw new Error("同じ応答への再開依頼はすでに試みました。重複送信しません。");
     }
     if (snap.draftText) throw new Error("入力欄に下書きがあるため、自動送信を見送りました。下書きは変更していません。");
     if (session.nudgeCount >= config.maxNudges) throw new Error("再開回数の上限です。回数をリセットしてください。");
+    if ((snap.runtimeFailure || forceRuntimeRecovery) && session.runtimeFailureStreak >= 2) {
+      throw new Error("ツール環境が連続して失敗しています。再開依頼を重ねず、新スレへの引き継ぎ状況を確認してください。");
+    }
     // Claim before clicking Send: an uncertain UI acknowledgement must never
     // reopen the same assistant turn for another automatic submission.
     await saveSession({
@@ -574,7 +619,9 @@
       status: "sending",
       detail: "同じ応答への重複送信を防ぎながら再開依頼を送っています…"
     });
-    await submitPrompt(config.prompt);
+    await submitPrompt(snap.runtimeFailure || forceRuntimeRecovery
+      ? core.buildRuntimeRecoveryPrompt({ config })
+      : config.prompt);
     await saveSession({
       enabled: true,
       candidateAssistantKey: null,
@@ -633,6 +680,7 @@
     }
 
     const snap = snapshot();
+    const runtimeFailureBeforeStop = snap.runtimeFailure;
     const stopButton = findGeneratingButton();
     if (!stopButton) {
       throw new Error("固着状態が変わりました。現在の画面を再確認してください。");
@@ -644,7 +692,7 @@
       throw new Error("ChatGPTの停止を確認できませんでした。メッセージは送っていません。");
     }
 
-    await nudgeNow();
+    await nudgeNow(null, runtimeFailureBeforeStop);
     return statusPayload();
   }
 
@@ -688,6 +736,8 @@
       throw new Error("同じプロジェクトへの引き継ぎは、プロジェクト内の会話だけで使えます。");
     }
     const snap = snapshot();
+    if (snap.generating) throw new Error("まだ応答中です。停止を確認してから引き継いでください。");
+    if (snap.draftText) throw new Error("入力欄の下書きを保護するため、新スレへの引き継ぎを見送りました。");
     const pending = {
       version: 1,
       reason,
@@ -699,8 +749,11 @@
       projectName: config.projectName,
       nudgeCount: session.nudgeCount,
       rolloverCount: session.rolloverCount + 1,
+      runtimeRolloverCount: session.runtimeRolloverCount + (reason === "tool_runtime_failure" ? 1 : 0),
+      runtimeFailureStreak: session.runtimeFailureStreak,
       prompt: core.buildRolloverPrompt({
         config,
+        reason,
         sourceUrl: location.href,
         lastUserText: snap.lastUser?.text,
         lastAssistantText: snap.lastAssistant?.text
@@ -769,6 +822,8 @@
         enabled: true,
         nudgeCount: 0,
         rolloverCount: Number(pending.rolloverCount || 1),
+        runtimeRolloverCount: Number(pending.runtimeRolloverCount || 0),
+        runtimeFailureStreak: Number(pending.runtimeFailureStreak || 0),
         status: "generating",
         detail: "新しいスレへ引き継ぎ、再開依頼を送りました👏🍵",
         updatedAt: Date.now()
@@ -798,6 +853,25 @@
       const snap = snapshot();
       const assistantKey = snap.assistantKey;
       const observationKey = snap.observationKey;
+      // Count each failed assistant turn once, even across reloads. A completed
+      // healthy turn clears the consecutive-failure count.
+      if (snap.runtimeFailure && assistantKey &&
+          assistantKey !== session.runtimeFailureTurnKey) {
+        await saveSession({
+          runtimeFailureStreak: session.runtimeFailureStreak + 1,
+          runtimeFailureTurnKey: assistantKey
+        });
+      } else if (snap.lastTurn?.role === "assistant" && snap.hasResponseActions &&
+                 !snap.runtimeFailure && !snap.runtimeTerminalFailure && session.runtimeFailureStreak) {
+        await saveSession({ runtimeFailureStreak: 0, runtimeFailureTurnKey: null });
+      }
+      // Earlier versions marked an already stopped turn as handled when
+      // monitoring was enabled. Reopen only an explicit unfinished tool error
+      // that has never received a nudge, including after an extension update.
+      if (snap.unfinishedToolError && snap.silentStalled &&
+          session.nudgeCount === 0 && assistantKey === session.lastHandledAssistantKey) {
+        await saveSession({ lastHandledAssistantKey: null });
+      }
       let candidateSeenAt = session.candidateSeenAt || 0;
       if (observationKey && observationKey !== session.candidateAssistantKey) {
         candidateSeenAt = Date.now();
@@ -834,6 +908,11 @@
         deliveryTimedOut: snap.deliveryTimedOut,
         thinkingFailed: snap.thinkingFailed,
         analysisFailed: snap.analysisFailed,
+        runtimeFailure: snap.runtimeFailure,
+        runtimeTerminalFailure: snap.runtimeTerminalFailure,
+        runtimeFailureStreak: session.runtimeFailureStreak,
+        runtimeRolloverCount: session.runtimeRolloverCount,
+        draftText: snap.draftText,
         retryableSendFailure: snap.retryableSendFailure,
         retryTurnKey: snap.retryTurnKey,
         lastRetriedTurnKey: session.lastRetriedTurnKey,
@@ -843,6 +922,7 @@
         lastRetriedStreamTurnKey: session.lastRetriedStreamTurnKey,
         composerReady: snap.composerReady,
         hasToolActivity: snap.hasToolActivity,
+        unfinishedToolError: snap.unfinishedToolError,
         hasResponseActions: snap.hasResponseActions,
         silentStalled: snap.silentStalled,
         lastRole: snap.lastTurn?.role,
@@ -869,6 +949,18 @@
         await recoverStuckResponse();
         return;
       }
+      if (decision.action === "stop_for_runtime_rollover") {
+        const stopButton = findGeneratingButton();
+        if (!stopButton || !snapshot().runtimeFailure) {
+          throw new Error("連続したツール失敗の表示が変わりました。操作せず画面を確認してください。");
+        }
+        stopButton.click();
+        if (!await waitFor(() => !findGeneratingButton(), 8000, 150)) {
+          throw new Error("応答の停止を確認できませんでした。新スレは作成していません。");
+        }
+        await beginRollover("tool_runtime_failure");
+        return;
+      }
       if (decision.action === "retry_failed_submission") {
         await retryFailedSubmission();
         return;
@@ -878,7 +970,8 @@
         return;
       }
       if (decision.action === "rollover") {
-        await beginRollover("capacity");
+        await beginRollover(decision.reason === "repeated_tool_runtime_failure"
+          ? "tool_runtime_failure" : "capacity");
         return;
       }
       if (decision.action === "complete") {
@@ -930,7 +1023,11 @@
           status: "paused",
           detail: decision.reason === "nudge_limit"
             ? `再開依頼が上限 ${config.maxNudges} 回に達したため停止しました。`
-            : "容量上限を検知しましたが、安全なプロジェクト内引き継ぎ先を確認できませんでした。"
+            : decision.reason === "runtime_failure_draft_protected"
+              ? "ツール環境が連続して失敗しました。入力欄に下書きがあるため、自動引き継ぎを停止しました。"
+              : decision.reason === "repeated_tool_runtime_failure"
+                ? "ツール環境が連続して失敗しました。自動引き継ぎは1回までです。GitHubの保存済み状態を確認してください。"
+                : "容量上限を検知しましたが、安全なプロジェクト内引き継ぎ先を確認できませんでした。"
         });
         return;
       }
@@ -958,6 +1055,19 @@
         const nextDetail = "下書きを保護しています。ストリーム再開エラーのRetryは押していません。";
         if (session.status !== "waiting" || session.detail !== nextDetail) {
           await saveSession({ status: "waiting", detail: nextDetail });
+        }
+        return;
+      }
+
+      if (decision.reason === "assistant_turn_already_handled" ||
+          decision.reason === "awaiting_assistant" ||
+          decision.reason === "no_assistant_turn") {
+        const nextStatus = "waiting";
+        const nextDetail = decision.reason === "assistant_turn_already_handled"
+          ? "監視開始前からある応答は処理済みです。次の応答を待っています。"
+          : "回答の到着を待っています。画面に応答があっても続く場合は、ChatGPTの表示を確認してください。";
+        if (session.status !== nextStatus || session.detail !== nextDetail) {
+          await saveSession({ status: nextStatus, detail: nextDetail });
         }
         return;
       }
@@ -1015,6 +1125,9 @@
         streamCacheFailure: snap.streamCacheFailure,
         silentStalled: snap.silentStalled,
         hasToolActivity: snap.hasToolActivity,
+        unfinishedToolError: snap.unfinishedToolError,
+        runtimeFailure: snap.runtimeFailure,
+        runtimeTerminalFailure: snap.runtimeTerminalFailure,
         hasResponseActions: snap.hasResponseActions,
         capacityLimited: snap.capacityLimited,
         completed: snap.completed,
@@ -1049,7 +1162,9 @@
           await beginRollover("manual");
           return { ok: true };
         case "RESET_COUNT":
-          await saveSession({ nudgeCount: 0, detail: "再開回数を0に戻しました。" });
+          await saveSession({ nudgeCount: 0, runtimeFailureStreak: 0,
+            runtimeFailureTurnKey: null, runtimeRolloverCount: 0,
+            detail: "再開回数とツール失敗回数を0に戻しました。" });
           return statusPayload();
         default:
           return { ok: false, error: "unknown_message" };

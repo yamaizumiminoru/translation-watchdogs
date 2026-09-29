@@ -14,6 +14,15 @@
   const DEFAULT_TERMINAL_ERROR_PROMPT =
     "ここまで進めてくれて本当にありがとう、おつかれさまでした👏🍵　エラーでこれ以上続けられない件、了解です。保存済みの状態はそのままにして、ここで止めます🙏";
 
+  function buildRuntimeRecoveryPrompt(input) {
+    const config = normalizeConfig(input?.config);
+    return "ここまでおつかれさまです👏🍵　直前のツール実行が ClientError または Analysis errored で止まりました。" +
+      "まず /mnt/data の存在確認だけを一度試してください。成功した場合のみ、" + config.repositoryUrl +
+      " の main にある保存済みの manifest・checkpoint を再取得し、小さな単位で翻訳を続けてください。" +
+      "同じツールエラーが再発したら実行を繰り返さず、GitHubに保存済みの状態と次の開始点を文章で報告してください。" +
+      "実際に全作業が完了した場合だけ " + config.completionMarker + " を付けてください。";
+  }
+
   const DEFAULTS = Object.freeze({
     prompt: DEFAULT_PROMPT,
     completionPrompt: DEFAULT_COMPLETION_PROMPT,
@@ -170,6 +179,20 @@
     return (hash >>> 0).toString(16).padStart(8, "0");
   }
 
+  // ChatGPT updates elapsed-time labels while a tool is running. A changing
+  // clock is not new output and must not restart the inactivity timer.
+  function progressText(text) {
+    return String(text || "").replace(
+      /(^|\n)(\s*Worked for\s+)\d+(?:h\s*)?\d*(?:m\s*)?\d*s\b/gi,
+      "$1$2<elapsed>"
+    );
+  }
+
+  function hasUnfinishedToolError(text) {
+    return /Encountered exception:\s*<class\s+['"][^'">]*\bClientError['"]>\.?\s*$/i
+      .test(String(text || "").trim());
+  }
+
   function makeTurnKey(turn) {
     if (!turn) return null;
     const id = String(turn.id || "unknown");
@@ -246,6 +269,13 @@
     return TERMINAL_ERROR_PATTERNS.some(pattern => pattern.test(source));
   }
 
+  function hasToolRuntimeTerminalReport(text) {
+    const source = String(text || "");
+    return /\bClientError\b|\bAnalysis errored\b|\/mnt\/data/i.test(source) &&
+      (hasTerminalErrorBlocker(source) ||
+        /(?:これ以上|今回は|ここでは).{0,80}(?:止めます|止める(?:ね)?|停止します|停止する)/s.test(source));
+  }
+
   function isExtensionContextInvalidated(error) {
     const message = String(error?.message || error || "");
     return /extension context invalidated/i.test(message);
@@ -258,7 +288,7 @@
       state.deliveryTimedOut !== true &&
       state.composerReady === true &&
       state.hasResponseActions === false &&
-      (state.hasToolActivity === true || state.analysisFailed === true);
+      (state.hasToolActivity === true || state.analysisFailed === true || state.unfinishedToolError === true);
   }
 
   function decideAction(input) {
@@ -296,9 +326,12 @@
         ? state.silentStallMs
         : DEFAULTS.silentStallSeconds * 1000;
       const frozenToolResponse = state.lastRole === "assistant" &&
-        state.hasToolActivity === true &&
+        (state.hasToolActivity === true || state.unfinishedToolError === true) &&
         state.composerReady === true;
       if (stableForMs >= stuckTimeoutMs && (state.deliveryTimedOut || frozenToolResponse)) {
+        if (state.runtimeFailure && state.runtimeFailureStreak >= 2) {
+          return repeatedRuntimeFailureAction(state, true);
+        }
         if (state.nudgeCount >= state.maxNudges) {
           return { action: "pause", reason: "nudge_limit" };
         }
@@ -322,8 +355,16 @@
     if (state.completed) return { action: "complete", reason: "completion_marker" };
     if (state.lastRole !== "assistant") return { action: "wait", reason: "awaiting_assistant" };
     if (!state.assistantKey) return { action: "wait", reason: "no_assistant_turn" };
+    if (state.runtimeFailure && state.runtimeFailureStreak >= 2) {
+      if (state.stableForMs < state.silentStallMs) return { action: "wait", reason: "settling" };
+      return repeatedRuntimeFailureAction(state, false);
+    }
     if (state.assistantKey === state.lastHandledAssistantKey) {
       return { action: "wait", reason: "assistant_turn_already_handled" };
+    }
+    if (state.runtimeTerminalFailure) {
+      if (state.stableForMs < state.settleMs) return { action: "wait", reason: "settling" };
+      return repeatedRuntimeFailureAction(state, false);
     }
     const requiredSettleMs = state.deliveryTimedOut || state.thinkingFailed
       ? state.deliveryTimeoutMs
@@ -349,6 +390,16 @@
     };
   }
 
+  function repeatedRuntimeFailureAction(state, generating) {
+    if (state.draftText) return { action: "pause", reason: "runtime_failure_draft_protected" };
+    if (!state.rolloverEnabled || !state.projectSlug || state.runtimeRolloverCount >= 1) {
+      return { action: "pause", reason: "repeated_tool_runtime_failure" };
+    }
+    return generating
+      ? { action: "stop_for_runtime_rollover", reason: "repeated_tool_runtime_failure" }
+      : { action: "rollover", reason: "repeated_tool_runtime_failure" };
+  }
+
   function tail(text, limit) {
     const source = String(text || "").trim();
     if (source.length <= limit) return source;
@@ -361,12 +412,21 @@
     const sourceUrl = String(value.sourceUrl || "").trim();
     const userTail = tail(value.lastUserText, 2500);
     const assistantTail = tail(value.lastAssistantText, 6000);
+    const reason = String(value.reason || "capacity");
+    const intro = reason === "capacity"
+      ? "前スレが容量上限に達したため"
+      : reason === "tool_runtime_failure"
+        ? "前スレのツール環境で ClientError / Analysis errored が連続したため"
+        : "前スレから引き継ぐため";
     const parts = [
-      "前スレが容量上限に達したため、同じ『" + config.projectName + "』プロジェクト内での続きです。おつかれさまです👏🍵",
+      intro + "、同じ『" + config.projectName + "』プロジェクト内での続きです。おつかれさまです👏🍵",
       "永続状態のリポジトリは " + config.repositoryUrl + " です。main の該当 projects/<slug>/ にある manifest・checkpoint・chunk inventory・QA・manuscript をあらためて取得し、記録された Next starting point から翻訳を再開してください。output は生成物なので直接編集しないでください。",
       "原典の権威はこのChatGPTプロジェクトにアップロードされたPDFです。構造が不確かな箇所はOCRだけで確定せず、ページ画像を確認してください。前スレの記憶だけで進捗や本文を推測しないでください。",
       "再開後は、作業を可能なところまで進めて保存してください。翻訳がすべて完了したときだけ、回答末尾に " + config.completionMarker + " と付けてください。"
     ];
+    if (reason === "tool_runtime_failure") {
+      parts.push("まず /mnt/data の存在確認だけを一度試してください。ツールが使える場合のみ保存済みの続きへ進み、同じエラーなら再試行を繰り返さず、保存済み状態と次の開始点を文章で報告してください。前スレの未保存作業を完了扱いにしないでください。");
+    }
     if (sourceUrl) parts.push(`引き継ぎ元スレ: ${sourceUrl}`);
     if (userTail) parts.push(`前スレ末尾のユーザーメッセージ抜粋:\n---\n${userTail}\n---`);
     if (assistantTail) parts.push(`前スレ末尾の応答抜粋:\n---\n${assistantTail}\n---`);
@@ -379,10 +439,13 @@
     DEFAULT_PROMPT,
     DEFAULT_COMPLETION_PROMPT,
     DEFAULT_TERMINAL_ERROR_PROMPT,
+    buildRuntimeRecoveryPrompt,
     DEFAULT_REPOSITORY_URL,
     normalizeConfig,
     parseChatGPTLocation,
     fnv1a,
+    progressText,
+    hasUnfinishedToolError,
     makeTurnKey,
     makeStableTurnKey,
     normalizeTurnRole,
@@ -396,6 +459,7 @@
     hasAnalysisErrorLabel,
     hasRetryableSendFailure,
     hasTerminalErrorBlocker,
+    hasToolRuntimeTerminalReport,
     isExtensionContextInvalidated,
     isSilentStallCandidate,
     decideAction,

@@ -117,6 +117,35 @@ test("collects separate stable user and assistant identities inside one shared t
   assert.equal(collect()[1].id, turns[1].id);
 });
 
+test("recovers an unwrapped Analysis errored control only after the latest user turn", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+  const start = source.indexOf("  function findUnwrappedAnalysisFailure(");
+  const end = source.indexOf("  function findGeneratingButton()", start);
+  assert.ok(start >= 0 && end > start);
+  const button = {
+    innerText: "Analysis errored",
+    closest: () => null,
+    parentElement: { innerText: "Analysis errored", querySelectorAll: () => [button] }
+  };
+  const lastTurn = { role: "user", id: "user-17", node: {
+    contains: () => false,
+    compareDocumentPosition: () => 4
+  } };
+  const context = { core, Node: { DOCUMENT_POSITION_FOLLOWING: 4 },
+    document: { querySelectorAll: () => [button] }, visible: () => true,
+    elementText: node => node.innerText };
+  const find = vm.runInNewContext(`${source.slice(start, end)}\nfindUnwrappedAnalysisFailure`, context);
+  const found = find(lastTurn);
+  assert.equal(found.role, "assistant");
+  assert.equal(found.id, "unwrapped-analysis-error:user-17");
+  assert.equal(core.hasAnalysisErrorLabel(found.text), true);
+  lastTurn.node.compareDocumentPosition = () => 2;
+  assert.equal(find(lastTurn), null);
+  lastTurn.node.compareDocumentPosition = () => 4;
+  button.closest = () => ({ className: "markdown" });
+  assert.equal(find(lastTurn), null);
+});
+
 test("failed-send Retry is keyed to a stable turn ID rather than changing error text", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
   assert.match(source, /retryTurnKey: core\.makeStableTurnKey\(lastTurn\)/);
@@ -184,6 +213,57 @@ test("automatically recovers when a tool response stays generating without any v
     action: "recover_stuck",
     reason: "generation_stuck_no_change"
   });
+});
+
+test("elapsed tool clocks do not reset the no-progress timer but new output does", () => {
+  const earlier = "Worked for 14m 40s\nEncountered exception: <class 'caas.internal.errors.ClientError'>.";
+  const later = "Worked for 14m 43s\nEncountered exception: <class 'caas.internal.errors.ClientError'>.";
+  const newOutput = `${later}\nprint('next')`;
+  const key = text => core.makeTurnKey({ id: "assistant-1", text: core.progressText(text) });
+  assert.equal(key(earlier), key(later));
+  assert.notEqual(key(later), key(newOutput));
+});
+
+test("an unfinished ClientError tool response gets the 180-second recovery window", () => {
+  const text = "Worked for 14m 40s\nEncountered exception: <class 'caas.internal.errors.ClientError'>.";
+  assert.equal(core.hasUnfinishedToolError(text), true);
+  assert.equal(core.hasUnfinishedToolError(`${text}\n訳出を再開します。`), false);
+  assert.equal(core.isSilentStallCandidate({
+    lastRole: "assistant", generating: false, composerReady: true,
+    hasResponseActions: false, hasToolActivity: false, unfinishedToolError: true
+  }), true);
+  const state = {
+    enabled: true, generating: true, lastRole: "assistant", composerReady: true,
+    hasToolActivity: false, unfinishedToolError: true,
+    stableForMs: 180000, silentStallMs: 180000,
+    nudgeCount: 0, maxNudges: 20
+  };
+  assert.deepEqual(core.decideAction(state), {
+    action: "recover_stuck", reason: "generation_stuck_no_change"
+  });
+});
+
+test("a manual nudge can resume an old baseline once while automatic duplicate recovery stays blocked", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+  const start = source.indexOf("  async function nudgeNow(");
+  const end = source.indexOf("  async function retryStreamCacheFailure()", start);
+  const session = { nudgeCount: 0, lastHandledAssistantKey: "assistant-old", status: "waiting" };
+  let sends = 0;
+  const context = {
+    route: { kind: "conversation" }, session, config: { maxNudges: 20, prompt: "続けて" },
+    snapshot: () => ({ generating: false, lastTurn: { role: "assistant" },
+      assistantKey: "assistant-old", draftText: "" }),
+    saveSession: async patch => Object.assign(session, patch),
+    submitPrompt: async () => { sends += 1; },
+    statusPayload: () => ({ ok: true })
+  };
+  const nudge = vm.runInNewContext(`${source.slice(start, end)}\nnudgeNow`, context);
+  await assert.rejects(nudge("assistant-old"), /重複送信/);
+  await nudge();
+  assert.equal(sends, 1);
+  assert.equal(session.nudgeCount, 1);
+  await assert.rejects(nudge(), /重複送信/);
+  assert.equal(sends, 1);
 });
 
 test("content monitor executes the verified stop-and-nudge recovery automatically", () => {
@@ -366,7 +446,7 @@ test("recovery latches the stable assistant turn before send or Retry", () => {
     core.makeTurnKey({ id: "assistant-1", text: "one two" }));
   const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
   const nudge = source.slice(source.indexOf("async function nudgeNow"), source.indexOf("async function retryStreamCacheFailure"));
-  assert.ok(nudge.indexOf("lastHandledAssistantKey: snap.assistantKey") < nudge.indexOf("await submitPrompt(config.prompt)"));
+  assert.ok(nudge.indexOf("lastHandledAssistantKey: snap.assistantKey") < nudge.indexOf("await submitPrompt(snap.runtimeFailure"));
   const retry = source.slice(source.indexOf("async function retryStreamCacheFailure"), source.indexOf("async function recoverStuckResponse"));
   assert.ok(retry.indexOf("lastRetriedStreamTurnKey: snap.streamCacheTurnKey") < retry.indexOf("retryButton.click()"));
 });
@@ -638,4 +718,95 @@ test("rollover prompt names the project, source, safeguards, and emoji", () => {
   assert.match(prompt, /C036まで保存済み/);
   assert.match(prompt, /👏🍵/);
   assert.match(prompt, /🙏/);
+});
+
+test("repeated runtime errors recover once, roll over once, then pause", () => {
+  const base = {
+    enabled: true, generating: false, lastRole: "assistant",
+    assistantKey: "failed-turn-2", lastHandledAssistantKey: "failed-turn-1",
+    runtimeFailure: true, runtimeFailureStreak: 2, runtimeRolloverCount: 0,
+    rolloverEnabled: true, projectSlug: "g-p-translation",
+    silentStallMs: 180000, stableForMs: 179999,
+    nudgeCount: 1, maxNudges: 100
+  };
+  assert.deepEqual(core.decideAction(base), { action: "wait", reason: "settling" });
+  assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000 }),
+    { action: "rollover", reason: "repeated_tool_runtime_failure" });
+  assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000,
+    runtimeRolloverCount: 1 }),
+  { action: "pause", reason: "repeated_tool_runtime_failure" });
+  assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000,
+    draftText: "編集中" }),
+  { action: "pause", reason: "runtime_failure_draft_protected" });
+  assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000,
+    projectSlug: null }),
+  { action: "pause", reason: "repeated_tool_runtime_failure" });
+  assert.deepEqual(core.decideAction({ ...base, runtimeFailureStreak: 1,
+    stableForMs: 180000 }),
+  { action: "nudge", reason: "assistant_stopped" });
+});
+
+test("a stuck generating runtime error must stop before rollover", () => {
+  const base = {
+    enabled: true, generating: true, lastRole: "assistant",
+    assistantKey: "failed-turn-2", composerReady: true,
+    unfinishedToolError: true, runtimeFailure: true,
+    runtimeFailureStreak: 2, runtimeRolloverCount: 0,
+    rolloverEnabled: true, projectSlug: "g-p-translation",
+    silentStallMs: 180000, stableForMs: 180000,
+    nudgeCount: 1, maxNudges: 100
+  };
+  assert.deepEqual(core.decideAction(base),
+    { action: "stop_for_runtime_rollover", reason: "repeated_tool_runtime_failure" });
+  assert.deepEqual(core.decideAction({ ...base, draftText: "編集中" }),
+    { action: "pause", reason: "runtime_failure_draft_protected" });
+});
+
+test("a stopped first ClientError keeps its diagnostic recovery prompt", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+  const start = source.indexOf("  async function recoverStuckResponse(");
+  const end = source.indexOf("  async function retryFailedSubmission(", start);
+  let generating = true;
+  let recoveryFlag = null;
+  const context = {
+    route: { kind: "conversation" }, session: { status: "stuck_timeout", nudgeCount: 0 },
+    config: { silentStallSeconds: 180, maxNudges: 20 },
+    snapshot: () => ({ runtimeFailure: generating }),
+    findGeneratingButton: () => generating ? { click: () => { generating = false; } } : null,
+    waitFor: async predicate => predicate(),
+    nudgeNow: async (_key, forceRuntimeRecovery) => { recoveryFlag = forceRuntimeRecovery; },
+    statusPayload: () => ({ ok: true })
+  };
+  const recover = vm.runInNewContext(`${source.slice(start, end)}\nrecoverStuckResponse`, context);
+  await recover();
+  assert.equal(recoveryFlag, true);
+});
+
+test("runtime recovery and handoff prompts do not claim a capacity limit", () => {
+  const config = { projectName: "翻訳", repositoryUrl: "https://github.com/example/translations" };
+  const recovery = core.buildRuntimeRecoveryPrompt({ config });
+  assert.match(recovery, /\/mnt\/data の存在確認だけを一度/);
+  assert.match(recovery, /再発したら実行を繰り返さず/);
+  assert.match(recovery, /github\.com\/example\/translations/);
+  const handoff = core.buildRolloverPrompt({ config, reason: "tool_runtime_failure" });
+  assert.match(handoff, /ClientError \/ Analysis errored が連続/);
+  assert.match(handoff, /同じエラーなら再試行を繰り返さず/);
+  assert.doesNotMatch(handoff, /容量上限に達した/);
+});
+
+test("a final report that tool calls cannot continue rolls over once", () => {
+  const report = "また ClientError になった。なので、ここではこれ以上ツール実行を繰り返さず止めるね。";
+  assert.equal(core.hasToolRuntimeTerminalReport(report), true);
+  assert.equal(core.hasToolRuntimeTerminalReport("ClientError を直したので続けます。"), false);
+  const base = {
+    enabled: true, generating: false, lastRole: "assistant",
+    assistantKey: "terminal-report", lastHandledAssistantKey: "previous",
+    runtimeTerminalFailure: true, terminalErrorBlocked: true,
+    runtimeRolloverCount: 0, rolloverEnabled: true,
+    projectSlug: "g-p-translation", stableForMs: 20000, settleMs: 20000
+  };
+  assert.deepEqual(core.decideAction(base),
+    { action: "rollover", reason: "repeated_tool_runtime_failure" });
+  assert.deepEqual(core.decideAction({ ...base, runtimeRolloverCount: 1 }),
+    { action: "pause", reason: "repeated_tool_runtime_failure" });
 });
