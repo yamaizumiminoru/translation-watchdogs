@@ -173,7 +173,7 @@ test("does not nudge while ChatGPT still exposes an active generation", () => {
   });
 });
 
-test("automatically recovers after a delivery timeout stays frozen for 180 seconds", () => {
+test("requests review without Stop after a delivery timeout stays frozen for 180 seconds", () => {
   const base = {
     enabled: true,
     generating: true,
@@ -189,12 +189,12 @@ test("automatically recovers after a delivery timeout stays frozen for 180 secon
     reason: "connection_interrupted_but_still_generating"
   });
   assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000 }), {
-    action: "recover_stuck",
-    reason: "delivery_timeout_stuck_generating"
+    action: "review",
+    reason: "generation_state_unverified"
   });
 });
 
-test("automatically recovers when a tool response stays generating without any visible change", () => {
+test("requests review without Stop when a tool response stays generating without visible change", () => {
   const base = {
     enabled: true,
     generating: true,
@@ -210,8 +210,8 @@ test("automatically recovers when a tool response stays generating without any v
   };
   assert.deepEqual(core.decideAction(base), { action: "wait", reason: "generating" });
   assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000 }), {
-    action: "recover_stuck",
-    reason: "generation_stuck_no_change"
+    action: "review",
+    reason: "generation_state_unverified"
   });
 });
 
@@ -239,7 +239,7 @@ test("an unfinished ClientError tool response gets the 180-second recovery windo
     nudgeCount: 0, maxNudges: 20
   };
   assert.deepEqual(core.decideAction(state), {
-    action: "recover_stuck", reason: "generation_stuck_no_change"
+    action: "review", reason: "generation_state_unverified"
   });
 });
 
@@ -250,7 +250,7 @@ test("a manual nudge can resume an old baseline once while automatic duplicate r
   const session = { nudgeCount: 0, lastHandledAssistantKey: "assistant-old", status: "waiting" };
   let sends = 0;
   const context = {
-    route: { kind: "conversation" }, session, config: { maxNudges: 20, prompt: "続けて" },
+    core, route: { kind: "conversation" }, session, config: { settleSeconds: 20, maxNudges: 20, prompt: "続けて" },
     snapshot: () => ({ generating: false, lastTurn: { role: "assistant" },
       assistantKey: "assistant-old", draftText: "" }),
     saveSession: async patch => Object.assign(session, patch),
@@ -266,12 +266,11 @@ test("a manual nudge can resume an old baseline once while automatic duplicate r
   assert.equal(sends, 1);
 });
 
-test("content monitor executes the verified stop-and-nudge recovery automatically", () => {
-  const contentSource = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
-  assert.match(
-    contentSource,
-    /if \(decision\.action === "recover_stuck"\)[\s\S]{0,900}await recoverStuckResponse\(\);/
-  );
+test("automatic monitor has no path that clicks Stop", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+  const tick = source.slice(source.indexOf("  async function tick()"), source.indexOf("  function scheduleTick()"));
+  assert.doesNotMatch(tick, /stopButton\.click|recoverStuckResponse|stop_for_runtime_rollover/);
+  assert.match(tick, /decision.action === "review"/);
 });
 
 test("does not classify a text-only long generation as a frozen tool response", () => {
@@ -338,7 +337,7 @@ test("recognizes exact Analysis errored control but not quoted prose", () => {
 
 test("Analysis errored waits 180 seconds of unchanged visible activity", () => {
   const base = {
-    enabled: true, generating: false, lastRole: "assistant",
+    enabled: true, now: 1000000, evidence: { manifestStatus: "incomplete", gitObservedAt: 999000 }, generating: false, lastRole: "assistant",
     assistantKey: "assistant-analysis", lastHandledAssistantKey: null,
     silentStalled: true, analysisFailed: true,
     stableForMs: 179999, silentStallMs: 180000,
@@ -534,7 +533,7 @@ test("content monitor clicks Retry through the bounded failed-submission recover
 
 test("recovers the frequent delivery timeout after its shorter grace period", () => {
   const base = {
-    enabled: true,
+    enabled: true, now: 1000000, evidence: { manifestStatus: "incomplete", gitObservedAt: 999000 },
     generating: false,
     capacityLimited: false,
     completed: false,
@@ -597,7 +596,7 @@ test("recognizes an invalidated Chrome extension context", () => {
 test("gives a silent stall a 180 second default grace period", () => {
   assert.equal(core.normalizeConfig({}).silentStallSeconds, 180);
   const base = {
-    enabled: true,
+    enabled: true, now: 1000000, evidence: { manifestStatus: "incomplete", gitObservedAt: 999000 },
     generating: false,
     capacityLimited: false,
     completed: false,
@@ -713,14 +712,14 @@ test("rollover prompt names the project, source, safeguards, and emoji", () => {
   assert.match(prompt, /同じ『翻訳』プロジェクト/);
   assert.match(prompt, /manifest・checkpoint/);
   assert.match(prompt, /github\.com\/yamaizumiminoru\/translations/);
-  assert.match(prompt, /原典の権威はこのChatGPTプロジェクトにアップロードされたPDF/);
+  assert.match(prompt, /原典の権威はこのChatGPTプロジェクトにアップロードされた分割PDF/);
   assert.match(prompt, /記憶だけで進捗や本文を推測しない/);
   assert.match(prompt, /C036まで保存済み/);
   assert.match(prompt, /👏🍵/);
   assert.match(prompt, /🙏/);
 });
 
-test("repeated runtime errors recover once, roll over once, then pause", () => {
+test("repeated runtime errors pause instead of automatically moving chats", () => {
   const base = {
     enabled: true, generating: false, lastRole: "assistant",
     assistantKey: "failed-turn-2", lastHandledAssistantKey: "failed-turn-1",
@@ -731,13 +730,13 @@ test("repeated runtime errors recover once, roll over once, then pause", () => {
   };
   assert.deepEqual(core.decideAction(base), { action: "wait", reason: "settling" });
   assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000 }),
-    { action: "rollover", reason: "repeated_tool_runtime_failure" });
+    { action: "pause", reason: "repeated_tool_runtime_failure" });
   assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000,
     runtimeRolloverCount: 1 }),
   { action: "pause", reason: "repeated_tool_runtime_failure" });
   assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000,
     draftText: "編集中" }),
-  { action: "pause", reason: "runtime_failure_draft_protected" });
+  { action: "wait", reason: "draft_protected" });
   assert.deepEqual(core.decideAction({ ...base, stableForMs: 180000,
     projectSlug: null }),
   { action: "pause", reason: "repeated_tool_runtime_failure" });
@@ -746,7 +745,7 @@ test("repeated runtime errors recover once, roll over once, then pause", () => {
   { action: "nudge", reason: "assistant_stopped" });
 });
 
-test("a stuck generating runtime error must stop before rollover", () => {
+test("a stuck generating runtime error requests review without automatic Stop", () => {
   const base = {
     enabled: true, generating: true, lastRole: "assistant",
     assistantKey: "failed-turn-2", composerReady: true,
@@ -757,9 +756,9 @@ test("a stuck generating runtime error must stop before rollover", () => {
     nudgeCount: 1, maxNudges: 100
   };
   assert.deepEqual(core.decideAction(base),
-    { action: "stop_for_runtime_rollover", reason: "repeated_tool_runtime_failure" });
+    { action: "review", reason: "generation_state_unverified" });
   assert.deepEqual(core.decideAction({ ...base, draftText: "編集中" }),
-    { action: "pause", reason: "runtime_failure_draft_protected" });
+    { action: "review", reason: "generation_state_unverified" });
 });
 
 test("a stopped first ClientError keeps its diagnostic recovery prompt", async () => {
@@ -771,14 +770,16 @@ test("a stopped first ClientError keeps its diagnostic recovery prompt", async (
   const context = {
     route: { kind: "conversation" }, session: { status: "stuck_timeout", nudgeCount: 0 },
     config: { silentStallSeconds: 180, maxNudges: 20 },
-    snapshot: () => ({ runtimeFailure: generating }),
+    snapshot: () => ({ runtimeFailure: generating, observationKey: "observed-1" }),
     findGeneratingButton: () => generating ? { click: () => { generating = false; } } : null,
     waitFor: async predicate => predicate(),
     nudgeNow: async (_key, forceRuntimeRecovery) => { recoveryFlag = forceRuntimeRecovery; },
     statusPayload: () => ({ ok: true })
   };
   const recover = vm.runInNewContext(`${source.slice(start, end)}\nrecoverStuckResponse`, context);
-  await recover();
+  await assert.rejects(recover(), /停止の確認/);
+  assert.equal(generating, true);
+  await recover({ confirmed: true, observationKey: "observed-1" });
   assert.equal(recoveryFlag, true);
 });
 
@@ -794,7 +795,7 @@ test("runtime recovery and handoff prompts do not claim a capacity limit", () =>
   assert.doesNotMatch(handoff, /容量上限に達した/);
 });
 
-test("a final report that tool calls cannot continue rolls over once", () => {
+test("a final report that tool calls cannot continue pauses for actual tool verification", () => {
   const report = "また ClientError になった。なので、ここではこれ以上ツール実行を繰り返さず止めるね。";
   assert.equal(core.hasToolRuntimeTerminalReport(report), true);
   assert.equal(core.hasToolRuntimeTerminalReport("ClientError を直したので続けます。"), false);
@@ -806,7 +807,8 @@ test("a final report that tool calls cannot continue rolls over once", () => {
     projectSlug: "g-p-translation", stableForMs: 20000, settleMs: 20000
   };
   assert.deepEqual(core.decideAction(base),
-    { action: "rollover", reason: "repeated_tool_runtime_failure" });
+    { action: "pause", reason: "repeated_tool_runtime_failure" });
   assert.deepEqual(core.decideAction({ ...base, runtimeRolloverCount: 1 }),
     { action: "pause", reason: "repeated_tool_runtime_failure" });
 });
+

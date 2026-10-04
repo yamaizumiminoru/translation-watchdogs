@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "翻訳おつかれ Watchdog",
-  "version": "0.3.15",
+  "version": "0.4.0",
   "description": "ChatGPTの翻訳スレを見守り、停止時に労いメッセージで再開し、容量上限時は同じプロジェクトへ引き継ぎます。",
   "icons": {
     "16": "icons/icon16.png",
@@ -36,3 +36,4 @@
     }
   ]
 }
+
