@@ -8,7 +8,7 @@
   const DEFAULT_REPOSITORY_URL = "https://github.com/yamaizumiminoru/translations";
   const DEFAULT_PROMPT =
     "ここまで本当にありがとう、おつかれさまです👏🍵　保存済みの続きからお願いします🙏\n" +
-    "ChatGPTプロジェクト内の原典PDFをページ画像で確認し、https://github.com/yamaizumiminoru/translations の main にある該当 projects/<slug>/ の manifest・checkpoint・chunk inventory・QA・manuscript を再取得してください。output は直接編集せず、未完了箇所から作業を続けてください。翻訳がすべて完了したときだけ、回答末尾に [[TRANSLATION_COMPLETE]] と付けてください。";
+    "担当エージェントさん、ChatGPTプロジェクト内の分割済み原典PDFを必要な範囲だけページ画像で確認し、https://github.com/yamaizumiminoru/translations の main にある該当 projects/<slug>/ の manifest・checkpoint・chunk inventory・QA・manuscript を再取得してください。output は直接編集せず、完了済みなら再開しないでください。未完了箇所から作業を続けてください。翻訳がすべて完了したときだけ、回答末尾に [[TRANSLATION_COMPLETE]] と付けてください。";
   const DEFAULT_COMPLETION_PROMPT =
     "完訳おつかれさまでした！最後まで本当にありがとう🍻🎉　保存と最終確認もありがとう。ここで終了です☺️";
   const DEFAULT_TERMINAL_ERROR_PROMPT =
@@ -55,6 +55,8 @@
     /network error/i,
     /message delivery timed out/i,
     /接続が中断/,
+    /接続が途切れました/,
+    /回答全体の受信を待っています/,
     /完全な回答を待って/,
     /ネットワークエラー/,
     /メッセージ.{0,20}タイムアウト/
@@ -183,7 +185,7 @@
   // clock is not new output and must not restart the inactivity timer.
   function progressText(text) {
     return String(text || "").replace(
-      /(^|\n)(\s*Worked for\s+)\d+(?:h\s*)?\d*(?:m\s*)?\d*s\b/gi,
+      /(^|\n)(\s*Worked for\s+)(?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s\b)?/gi,
       "$1$2<elapsed>"
     );
   }
@@ -291,9 +293,73 @@
       (state.hasToolActivity === true || state.analysisFailed === true || state.unfinishedToolError === true);
   }
 
+  // Evidence is scoped by the caller to one monitored conversation. Timestamps
+  // are milliseconds since epoch; a failed read never becomes evidence of idle.
+  function updateEvidence(previous, observation) {
+    const prior = previous || {};
+    const value = observation || {};
+    const now = Number(value.observedAt);
+    if (!Number.isFinite(now) || now <= 0 || now < (prior.observedAt || 0)) return prior;
+    const next = { ...prior, observedAt: now };
+    if (["ok", "failed"].includes(value.readStatus)) next.readStatus = value.readStatus;
+    if (value.readStatus === "ok" && value.gitSha && /^[0-9a-f]{40}$/i.test(value.gitSha) &&
+        Number.isFinite(value.gitSavedAt) && value.gitSavedAt > 0 && value.gitSavedAt <= now) {
+      const changed = value.gitSha !== prior.lastGitSavedSHA;
+      next.lastGitSavedSHA = value.gitSha;
+      next.lastGitSavedAt = value.gitSavedAt;
+      // First observation and re-reading an old SHA are baselines, not activity.
+      if (changed && prior.lastGitSavedSHA && value.gitSavedAt > (prior.lastGitSavedAt || 0)) {
+        next.lastActualActivityAt = Math.max(prior.lastActualActivityAt || 0, value.gitSavedAt);
+      }
+      next.gitObservedAt = now;
+      next.manifestStatus = prior.manifestStatus === "complete" ? "complete" :
+        ["complete", "incomplete"].includes(value.manifestStatus) ? value.manifestStatus : "unknown";
+    }
+    if (value.readStatus === "failed" && prior.manifestStatus !== "complete") next.manifestStatus = "unknown";
+    if (value.activityKey && prior.activityKey && value.activityKey !== prior.activityKey) {
+      next.lastActualActivityAt = now;
+    }
+    if (value.activityKey) next.activityKey = value.activityKey;
+    return next;
+  }
+
+  function observeReceipt(receipt, observation) {
+    if (!receipt?.sentAt || receipt.executedAt || !observation?.activityKey ||
+        observation.observedAt <= receipt.sentAt) return receipt;
+    const followsRequest = receipt.userTurnId && observation.afterUserTurnId === receipt.userTurnId;
+    const retriedOutputChanged = receipt.targetAssistantId &&
+      observation.assistantId === receipt.targetAssistantId &&
+      observation.activityKey !== receipt.baselineActivityKey;
+    return followsRequest || retriedOutputChanged
+      ? { ...receipt, executedAt: observation.observedAt } : receipt;
+  }
+
+  function recoveryBackoffMs(attempts, baseMs = 20000) {
+    return Math.min(15 * 60 * 1000, baseMs * 2 ** Math.min(6, Math.max(0, attempts || 0)));
+  }
+
+  function safetyGate(state) {
+    const evidence = state.evidence || {};
+    if (state.completed || evidence.manifestStatus === "complete") {
+      return { action: "complete", reason: state.completed ? "completion_marker" : "saved_manifest_complete" };
+    }
+    if (state.awaitingApproval || state.awaitingLogin) return { action: "wait", reason: "human_action_required" };
+    if (evidence.readStatus === "failed") return { action: "wait", reason: "evidence_read_failed" };
+    if (evidence.lastActualActivityAt && state.now - evidence.lastActualActivityAt < state.silentStallMs) {
+      return { action: "wait", reason: "recent_actual_activity" };
+    }
+    if (state.receipt?.sentAt && !state.receipt.executedAt && !state.retryableSendFailure) {
+      return { action: "wait", reason: "execution_unverified" };
+    }
+    if (state.nextRecoveryAt && state.now < state.nextRecoveryAt) return { action: "wait", reason: "recovery_backoff" };
+    return null;
+  }
+
   function decideAction(input) {
     const state = input && typeof input === "object" ? input : {};
     if (!state.enabled) return { action: "disabled", reason: "monitor_off" };
+    const safety = safetyGate(state);
+    if (safety) return safety;
     if (state.streamCacheFailure) {
       if (state.streamCacheTurnKey && state.streamCacheTurnKey === state.lastRetriedStreamTurnKey) {
         return { action: "wait", reason: "stream_cache_retry_already_attempted" };
@@ -318,6 +384,7 @@
       if (state.stableForMs < retryDelayMs) {
         return { action: "wait", reason: "settling" };
       }
+      if (state.nudgeCount >= state.maxNudges) return { action: "pause", reason: "nudge_limit" };
       return { action: "retry_failed_submission", reason: "retryable_send_failure" };
     }
     if (state.generating) {
@@ -329,25 +396,22 @@
         (state.hasToolActivity === true || state.unfinishedToolError === true) &&
         state.composerReady === true;
       if (stableForMs >= stuckTimeoutMs && (state.deliveryTimedOut || frozenToolResponse)) {
-        if (state.runtimeFailure && state.runtimeFailureStreak >= 2) {
-          return repeatedRuntimeFailureAction(state, true);
-        }
-        if (state.nudgeCount >= state.maxNudges) {
-          return { action: "pause", reason: "nudge_limit" };
-        }
-        return {
-          action: "recover_stuck",
-          reason: state.deliveryTimedOut
-            ? "delivery_timeout_stuck_generating"
-            : "generation_stuck_no_change"
-        };
+        if (state.nudgeCount >= state.maxNudges) return { action: "pause", reason: "nudge_limit" };
+        return { action: "review", reason: "generation_state_unverified" };
       }
       return {
         action: "wait",
         reason: state.interrupted ? "connection_interrupted_but_still_generating" : "generating"
       };
     }
+    if (state.draftText) return { action: "wait", reason: "draft_protected" };
+    if ((state.silentStalled || state.interrupted || state.deliveryTimedOut) &&
+        (state.evidence?.manifestStatus !== "incomplete" ||
+          !state.evidence.gitObservedAt || state.now - state.evidence.gitObservedAt > 5 * 60 * 1000)) {
+      return { action: "wait", reason: "saved_state_unknown" };
+    }
     if (state.capacityLimited) {
+      if (state.nudgeCount >= state.maxNudges || state.rolloverCount >= 1) return { action: "pause", reason: "nudge_limit" };
       return state.rolloverEnabled && state.projectSlug
         ? { action: "rollover", reason: "conversation_capacity" }
         : { action: "pause", reason: "capacity_without_safe_rollover" };
@@ -395,9 +459,7 @@
     if (!state.rolloverEnabled || !state.projectSlug || state.runtimeRolloverCount >= 1) {
       return { action: "pause", reason: "repeated_tool_runtime_failure" };
     }
-    return generating
-      ? { action: "stop_for_runtime_rollover", reason: "repeated_tool_runtime_failure" }
-      : { action: "rollover", reason: "repeated_tool_runtime_failure" };
+    return { action: "pause", reason: "repeated_tool_runtime_failure" };
   }
 
   function tail(text, limit) {
@@ -421,7 +483,7 @@
     const parts = [
       intro + "、同じ『" + config.projectName + "』プロジェクト内での続きです。おつかれさまです👏🍵",
       "永続状態のリポジトリは " + config.repositoryUrl + " です。main の該当 projects/<slug>/ にある manifest・checkpoint・chunk inventory・QA・manuscript をあらためて取得し、記録された Next starting point から翻訳を再開してください。output は生成物なので直接編集しないでください。",
-      "原典の権威はこのChatGPTプロジェクトにアップロードされたPDFです。構造が不確かな箇所はOCRだけで確定せず、ページ画像を確認してください。前スレの記憶だけで進捗や本文を推測しないでください。",
+      "原典の権威はこのChatGPTプロジェクトにアップロードされた分割PDFです。今回の5分割を含め、既存の分割とページ対応を維持し、全冊PDFの再添付を求めないでください。構造が不確かな箇所はOCRだけで確定せず、ページ画像を確認してください。前スレの記憶だけで進捗や本文を推測しないでください。",
       "再開後は、作業を可能なところまで進めて保存してください。翻訳がすべて完了したときだけ、回答末尾に " + config.completionMarker + " と付けてください。"
     ];
     if (reason === "tool_runtime_failure") {
@@ -462,7 +524,12 @@
     hasToolRuntimeTerminalReport,
     isExtensionContextInvalidated,
     isSilentStallCandidate,
+    updateEvidence,
+    observeReceipt,
+    recoveryBackoffMs,
+    safetyGate,
     decideAction,
     buildRolloverPrompt
   };
 });
+

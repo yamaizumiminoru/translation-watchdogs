@@ -24,7 +24,11 @@
     stopOnTerminalError: document.querySelector("#stop-on-terminal-error"),
     save: document.querySelector("#save"),
     resetCount: document.querySelector("#reset-count"),
-    message: document.querySelector("#message")
+    message: document.querySelector("#message"),
+    recordEvidence: document.querySelector("#record-evidence"),
+    gitSha: document.querySelector("#git-sha"),
+    gitSavedAt: document.querySelector("#git-saved-at"),
+    manifestStatus: document.querySelector("#manifest-status")
   };
 
   let activeTabId = null;
@@ -91,9 +95,9 @@
       armed: "見守り中",
       waiting: "待機中",
       settling: "停止確認中",
-      generating: "翻訳中",
+      generating: "画面は応答中・実行未確認",
       interrupted: "接続中断・待機中",
-      stuck_timeout: "応答固着",
+      stuck_timeout: "無変化・要確認",
       retrying: "送信を再試行中",
       sent: "再開依頼済み",
       rollover: "新スレへ引き継ぎ中",
@@ -116,14 +120,15 @@
     elements.counter.textContent = `再開 ${session?.nudgeCount || 0}/${current.config?.maxNudges || 0} 回 ・ 新スレ引き継ぎ ${session?.rolloverCount || 0} 回`;
     elements.toggle.textContent = enabled ? "見守りを止める" : "このスレを見守る";
     elements.toggle.classList.toggle("primary", !enabled);
-    elements.toggle.disabled = !inConversation;
+    const completed = Boolean(snapshot?.completed || session?.completionConfirmed || session?.evidence?.manifestStatus === "complete");
+    elements.toggle.disabled = !inConversation || completed;
     const stuckTimeout = status === "stuck_timeout";
     elements.nudge.textContent = stuckTimeout
       ? "停止して労って続ける🙏"
       : "今すぐ労って続けて🙏";
     elements.nudge.classList.toggle("danger-outline", stuckTimeout);
-    elements.nudge.disabled = !inConversation || (Boolean(snapshot?.generating) && !stuckTimeout);
-    elements.rollover.disabled = !inConversation || !route?.projectSlug;
+    elements.nudge.disabled = !inConversation || completed || (Boolean(snapshot?.generating) && !stuckTimeout);
+    elements.rollover.disabled = !inConversation || completed || Boolean(snapshot?.generating) || !route?.projectSlug;
   }
 
   async function initialize() {
@@ -151,7 +156,7 @@
     const stuckTimeout = current?.session?.status === "stuck_timeout";
     if (stuckTimeout) {
       const accepted = confirm(
-        `ChatGPTは停止ボタンを表示していますが、${current?.config?.silentStallSeconds || 180}秒以上、本文・ツール履歴が変化していません。現在の応答を停止し、労い＋再開メッセージを送ります。よろしいですか？`
+        `ChatGPTは停止ボタンを表示していますが、${current?.config?.silentStallSeconds || 180}秒以上、本文・ツール履歴が変化していません。裏で進行している可能性があります。まず停止せずに送れるか確認してください。それでも現在の処理を中断し、再開メッセージを送ることを許可しますか？`
       );
       if (!accepted) return;
     }
@@ -159,11 +164,12 @@
       showMessage("");
       await send({
         type: stuckTimeout ? "RECOVER_STUCK_TIMEOUT" : "NUDGE_NOW",
+        authorization: stuckTimeout ? { confirmed: true, observationKey: current?.snapshot?.observationKey } : undefined,
         config: formConfig()
       });
       showMessage(stuckTimeout
-        ? "固着した応答を停止し、労い＋再開依頼を送りました👏🍵"
-        : "労い＋再開依頼を送りました👏🍵");
+        ? "停止後、依頼の画面表示を確認しました。保存・実行は未確認です"
+        : "依頼の画面表示を確認しました。保存・実行は未確認です");
     } catch (error) {
       showMessage(error.message, true);
     }
@@ -181,6 +187,22 @@
     } catch (error) {
       showMessage(error.message, true);
     }
+  });
+
+  elements.recordEvidence.addEventListener("click", async () => {
+    try {
+      const manifestStatus = elements.manifestStatus.value;
+      const gitSha = elements.gitSha.value.trim();
+      const gitSavedAt = Date.parse(elements.gitSavedAt.value);
+      const observedAt = Date.now();
+      if (manifestStatus !== "failed" && (!/^[0-9a-f]{40}$/i.test(gitSha) || !Number.isFinite(gitSavedAt) || gitSavedAt > observedAt)) {
+        throw new Error("40桁のSHAと、未来ではない保存日時を入力してください。");
+      }
+      if (manifestStatus === "complete" && !confirm("この会話の正本で全作業完了を確認しましたか？以後この会話を再開しません。")) return;
+      await send({ type: "RECORD_EVIDENCE", sessionKey: current?.route?.sessionKey,
+        evidence: { observedAt, readStatus: manifestStatus === "failed" ? "failed" : "ok", gitSha, gitSavedAt, manifestStatus } });
+      showMessage("確認結果を記録しました。古いコミットの再読は新しい進捗に数えません。");
+    } catch (error) { showMessage(error.message, true); }
   });
 
   elements.save.addEventListener("click", async () => {
@@ -213,3 +235,4 @@
     showMessage(error.message, true);
   });
 })();
+

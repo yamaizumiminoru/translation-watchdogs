@@ -32,6 +32,17 @@
     </section>
 
     <details>
+      <summary>確認済みの保存状態を記録</summary>
+      <p>この拡張はGitHubを直接読みません。同じ会話の正本を読み直した結果だけを入力してください。完了の記録はこの会話では解除できません。</p>
+      <label>mainで確認したコミットSHA（40桁）<input id="git-sha" type="text"></label>
+      <label>そのコミットの保存日時（UTC ISO 8601）<input id="git-saved-at" type="text" placeholder="2026-10-04T05:00:00Z"></label>
+      <label>manifest・checkpointの確認結果
+        <select id="manifest-status"><option value="unknown">不明</option><option value="incomplete">未完了</option><option value="complete">全作業完了</option><option value="failed">読み取り失敗</option></select>
+      </label>
+      <button id="record-evidence" type="button">この会話の確認結果を記録</button>
+    </details>
+
+    <details>
       <summary>設定</summary>
       <label>
         労い＋再開メッセージ
@@ -51,11 +62,11 @@
           <input id="max-nudges" type="number" min="1" max="100">
         </label>
         <label>
-          停止確認（秒）
+          応答の安定確認（秒）
           <input id="settle-seconds" type="number" min="5" max="300">
         </label>
         <label>
-          無変化停止の確認（秒）
+          無変化の観察（秒・自動停止なし）
           <input id="silent-stall-seconds" type="number" min="30" max="600">
         </label>
         <label>
@@ -77,7 +88,7 @@
       </label>
       <label class="check-row">
         <input id="rollover-enabled" type="checkbox">
-        容量上限・ツールの連続失敗時、同じプロジェクトの新スレへ自動引き継ぎ
+        容量上限時、同じプロジェクトの新スレへ一度だけ自動引き継ぎ
       </label>
       <label class="check-row">
         <input id="stop-on-terminal-error" type="checkbox">
@@ -95,3 +106,4 @@
   <script src="popup.js"></script>
 </body>
 </html>
+

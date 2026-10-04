@@ -14,6 +14,7 @@
   let session = null;
   let tickTimer = null;
   let tickRunning = false;
+  let commandRunning = false;
   let lastUrl = location.href;
   let contextAlive = true;
 
@@ -78,6 +79,10 @@
   function defaultSession() {
     return {
       enabled: false,
+      evidence: {},
+      receipt: null,
+      nextRecoveryAt: 0,
+      completionConfirmed: false,
       nudgeCount: 0,
       rolloverCount: 0,
       runtimeFailureStreak: 0,
@@ -467,15 +472,18 @@
           retryableSendFailure ? "retryable-send-failure" : "no-retryable-send-failure"
         ].join("\n"))}`
       : null;
+    const actualOutput = core.progressText(Array.from(lastAssistant?.node?.querySelectorAll(".markdown, pre") || []).map(elementText).join("\n")).trim();
     return {
       turns,
       lastTurn,
       lastAssistant,
       lastUser,
+      afterUserTurnId: lastAssistant && lastUser && turns.indexOf(lastAssistant) > turns.indexOf(lastUser) ? lastUser.id : null,
       assistantKey,
       lastTurnKey,
       observationKey,
       generating,
+      activityKey: actualOutput ? core.makeTurnKey({ id: lastAssistant.id, text: actualOutput }) : null,
       composerReady,
       draftText,
       streamCacheFailure,
@@ -484,6 +492,7 @@
       retryTurnKey: core.makeStableTurnKey(lastTurn),
       hasToolActivity: structure.hasToolActivity,
       unfinishedToolError,
+      runtimeFailure,
       hasResponseActions: structure.hasResponseActions,
       silentStalled,
       interrupted: core.hasTransientInterruption(statusText),
@@ -493,6 +502,7 @@
       retryableSendFailure,
       capacityLimited: core.hasCapacityLimit(statusText),
       terminalErrorBlocked: core.hasTerminalErrorBlocker(lastAssistant?.text),
+      awaitingHuman: structure.hasResponseActions && /(?:承認|許可|ログイン|サインイン).{0,30}(?:待ち|必要|してください)|waiting for (?:approval|permission)|please (?:log|sign) in/i.test(lastAssistant?.text || ""),
       runtimeTerminalFailure: structure.hasResponseActions &&
         core.hasToolRuntimeTerminalReport(lastAssistant?.text),
       completed: core.hasCompletionMarker(lastAssistant?.text, config.completionMarker)
@@ -546,12 +556,14 @@
     setComposerValue(composer, text);
     const sendButton = await waitFor(findSendButton, 2500);
     if (!sendButton) throw new Error("送信ボタンが有効になりませんでした。メッセージは送っていません。");
+    await saveSession({ receipt: { sentAt: Date.now(), displayedAt: null, persistedAt: null, executedAt: null } });
     sendButton.click();
 
-    const submitted = await waitFor(() => collectTurns().some(turn =>
+    const submitted = await waitFor(() => collectTurns().find(turn =>
       turn.role === "user" && !beforeIds.has(turn.id) &&
       normalizedText(turn.text).startsWith(prefix)
     ), 5000);
+    if (submitted) await saveSession({ receipt: { ...session.receipt, displayedAt: Date.now(), userTurnId: submitted.id } });
     if (!submitted) {
       throw new Error("新しいユーザーメッセージを確認できませんでした。重複防止のため自動再送はしません。");
     }
@@ -560,6 +572,10 @@
   async function enableMonitor() {
     if (route.kind !== "conversation") throw new Error("ChatGPTの会話ページで監視を開始してください。");
     const snap = snapshot();
+    if (snap.completed || session.completionConfirmed || session.evidence?.manifestStatus === "complete") {
+      await saveSession({ enabled: false, completionConfirmed: true, status: "complete", detail: "完了済みです。再開しません。" });
+      return statusPayload();
+    }
     const recoverTimedOutTurn = snap.deliveryTimedOut && !snap.generating;
     const recoverSilentStall = snap.silentStalled;
     const recoverCurrentTurn = recoverTimedOutTurn || recoverSilentStall || snap.thinkingFailed || snap.streamCacheFailure;
@@ -570,7 +586,7 @@
       candidateSeenAt: snap.generating || recoverCurrentTurn ? Date.now() : 0,
       status: snap.generating ? "generating" : recoverCurrentTurn ? "settling" : "armed",
       detail: snap.generating
-        ? "応答中です。停止したら労って続きを頼みます👏🍵"
+        ? "画面は応答中です。実際の進行を確認し、自動停止せず待ちます。"
         : recoverTimedOutTurn
           ? `配信タイムアウトを検出しました。${config.deliveryTimeoutSeconds}秒後に続きを頼みます👏🍵`
           : snap.streamCacheFailure
@@ -594,7 +610,10 @@
   async function nudgeNow(expectedAssistantKey = null, forceRuntimeRecovery = false) {
     if (route.kind !== "conversation") throw new Error("会話ページで実行してください。");
     const snap = snapshot();
-    if (snap.generating) throw new Error("まだ応答中です。完全に止まってから実行してください。");
+    if (snap.completed || session.completionConfirmed || session.evidence?.manifestStatus === "complete") throw new Error("完了済みの作業は再開しません。");
+    if (snap.awaitingHuman) throw new Error("承認・ログイン待ちです。自動続行しません。");
+    if (session.receipt?.sentAt && !session.receipt.executedAt) throw new Error("前の依頼の実行は未確認です。重複送信しません。");
+    if (snap.generating) throw new Error("応答状態は未確認です。停止せずに送れるか手動で確認してください。");
     if (snap.lastTurn?.role !== "assistant" || !snap.assistantKey ||
         (expectedAssistantKey && snap.assistantKey !== expectedAssistantKey)) {
       throw new Error("対象の応答が変わりました。送信せず画面を再確認してください。");
@@ -614,6 +633,7 @@
     await saveSession({
       nudgeCount: session.nudgeCount + 1,
       lastHandledAssistantKey: snap.assistantKey,
+      nextRecoveryAt: Date.now() + core.recoveryBackoffMs(session.nudgeCount, config.settleSeconds * 1000),
       candidateAssistantKey: null,
       candidateSeenAt: 0,
       status: "sending",
@@ -627,7 +647,7 @@
       candidateAssistantKey: null,
       candidateSeenAt: 0,
       status: "sent",
-      detail: `労い＋再開依頼を送りました👏🍵（${session.nudgeCount}/${config.maxNudges}）`
+      detail: `再開依頼が画面に表示されました。保存・実行は未確認です（${session.nudgeCount}/${config.maxNudges}）`
     });
     return statusPayload();
   }
@@ -653,6 +673,8 @@
       candidateSeenAt: Date.now(),
       detail: "ストリーム再開エラーのRetryを1回だけ試しています。下書きは変更しません。"
     });
+    await saveSession({ receipt: { sentAt: Date.now(), displayedAt: null, persistedAt: null, executedAt: null,
+      targetAssistantId: snap.lastAssistant?.id, baselineActivityKey: snap.activityKey } });
     retryButton.click();
     const resumed = await waitFor(() => {
       const next = snapshot();
@@ -665,12 +687,19 @@
       status: "sent",
       candidateAssistantKey: null,
       candidateSeenAt: 0,
-      detail: "ストリーム再開エラーのRetry後、応答再開を確認しました。下書きはそのままです。"
+      detail: "Retry後の表示変化を確認しました。保存・実行は未確認です。"
     });
     return statusPayload();
   }
 
-  async function recoverStuckResponse() {
+  async function recoverStuckResponse(authorization) {
+    if (authorization?.confirmed !== true || authorization.observationKey !== snapshot().observationKey) {
+      throw new Error("現在の画面に対する停止の確認が必要です。");
+    }
+    if (session.completionConfirmed || snapshot().completed || session.evidence?.manifestStatus === "complete") throw new Error("完了済みの作業は停止・再開しません。");
+    if (session.receipt?.sentAt && !session.receipt.executedAt) throw new Error("依頼の実行は未確認です。停止・再送しません。");
+    if (snapshot().awaitingHuman) throw new Error("承認・ログイン待ちのため停止しません。");
+    if (snapshot().draftText) throw new Error("下書きを保護するため停止しません。");
     if (route.kind !== "conversation") throw new Error("会話ページで実行してください。");
     if (session.status !== "stuck_timeout") {
       throw new Error(`${config.silentStallSeconds}秒以上の応答固着をまだ確認できていません。`);
@@ -699,10 +728,12 @@
   async function retryFailedSubmission() {
     if (route.kind !== "conversation") throw new Error("会話ページで実行してください。");
     const snap = snapshot();
+    if (snap.completed || session.completionConfirmed || session.evidence?.manifestStatus === "complete") throw new Error("完了済みの作業は再試行しません。");
     const retryButton = findRetryButton(snap.lastTurn);
     if (!snap.retryableSendFailure || !retryButton || !snap.lastTurnKey) {
       throw new Error("再試行できる送信失敗が見つかりません。現在の画面を再確認してください。");
     }
+    if (session.nudgeCount >= config.maxNudges) throw new Error("再開回数の上限です。");
     if (session.lastRetriedTurnKey === snap.retryTurnKey) {
       throw new Error("同じ送信失敗への自動Retryはすでに1回実行しました。");
     }
@@ -710,9 +741,13 @@
     await saveSession({
       status: "retrying",
       lastRetriedTurnKey: snap.retryTurnKey,
+      nudgeCount: session.nudgeCount + 1,
+      nextRecoveryAt: Date.now() + core.recoveryBackoffMs(session.nudgeCount, config.settleSeconds * 1000),
       candidateSeenAt: Date.now(),
       detail: "再開依頼の送信失敗を検出しました。Retryで同じメッセージを1回だけ再送します👏🍵"
     });
+    await saveSession({ receipt: { sentAt: Date.now(), displayedAt: null, persistedAt: null, executedAt: null,
+      userTurnId: snap.lastTurn?.id } });
     retryButton.click();
     const retried = await waitFor(() => {
       const next = snapshot();
@@ -726,7 +761,7 @@
       status: "sent",
       candidateAssistantKey: null,
       candidateSeenAt: 0,
-      detail: "送信失敗した労い＋再開依頼をRetryで再送しました👏🍵"
+      detail: "Retry操作後の表示変化を確認しました。保存・実行は未確認です。"
     });
     return statusPayload();
   }
@@ -736,7 +771,10 @@
       throw new Error("同じプロジェクトへの引き継ぎは、プロジェクト内の会話だけで使えます。");
     }
     const snap = snapshot();
-    if (snap.generating) throw new Error("まだ応答中です。停止を確認してから引き継いでください。");
+    if (snap.completed || session.completionConfirmed || session.evidence?.manifestStatus === "complete") throw new Error("完了済みの作業は引き継ぎません。");
+    if (session.receipt?.sentAt && !session.receipt.executedAt) throw new Error("依頼の実行は未確認です。新スレへの重複送信はしません。");
+    if (session.nudgeCount >= config.maxNudges || session.rolloverCount >= 1) throw new Error("引き継ぎの上限です。保存状態を確認してください。");
+    if (snap.generating) throw new Error("まだ応答中表示です。停止せず状態を確認してください。");
     if (snap.draftText) throw new Error("入力欄の下書きを保護するため、新スレへの引き継ぎを見送りました。");
     const pending = {
       version: 1,
@@ -747,7 +785,7 @@
       projectSlug: route.projectSlug,
       projectBaseUrl: route.projectBaseUrl,
       projectName: config.projectName,
-      nudgeCount: session.nudgeCount,
+      nudgeCount: session.nudgeCount + 1,
       rolloverCount: session.rolloverCount + 1,
       runtimeRolloverCount: session.runtimeRolloverCount + (reason === "tool_runtime_failure" ? 1 : 0),
       runtimeFailureStreak: session.runtimeFailureStreak,
@@ -805,6 +843,14 @@
         await submitPrompt(pending.prompt);
         pending.stage = "submitted";
         pending.submittedAt = Date.now();
+        pending.receipt = { ...session.receipt };
+        const target = await waitFor(() => {
+          const current = core.parseChatGPTLocation(location.href);
+          return current.kind === "conversation" && current.projectSlug === pending.projectSlug &&
+            current.conversationId !== core.parseChatGPTLocation(pending.sourceUrl).conversationId ? current : null;
+        }, 5000, 150);
+        if (!target) throw new Error("送信の画面表示は確認しましたが、新しい会話URLは未確認です。再送・自動監視はしません。");
+        pending.targetConversationId = target.conversationId;
         await storageSet({ [PENDING_ROLLOVER_KEY]: pending });
       } catch (error) {
         pending.stage = "blocked";
@@ -816,11 +862,15 @@
     }
 
     if (route.kind === "conversation" && pending.stage === "submitted") {
+      const targetMatches = pending.targetConversationId && route.conversationId === pending.targetConversationId &&
+        pending.receipt?.userTurnId && snapshot().turns.some(turn => turn.role === "user" && turn.id === pending.receipt.userTurnId);
+      if (!targetMatches) return false;
       const key = sessionStorageKey();
       session = {
         ...defaultSession(),
         enabled: true,
-        nudgeCount: 0,
+        nudgeCount: Number(pending.nudgeCount || 0),
+        receipt: pending.receipt,
         rolloverCount: Number(pending.rolloverCount || 1),
         runtimeRolloverCount: Number(pending.runtimeRolloverCount || 0),
         runtimeFailureStreak: Number(pending.runtimeFailureStreak || 0),
@@ -838,7 +888,7 @@
   }
 
   async function tick() {
-    if (!contextAlive || tickRunning) return;
+    if (!contextAlive || tickRunning || commandRunning) return;
     tickRunning = true;
     try {
       if (location.href !== lastUrl) {
@@ -851,6 +901,10 @@
       if (route.kind !== "conversation" || !session?.enabled) return;
 
       const snap = snapshot();
+      const evidence = core.updateEvidence(session.evidence, { observedAt: Date.now(), activityKey: snap.activityKey });
+      const receipt = core.observeReceipt(session.receipt, { observedAt: Date.now(),
+        activityKey: snap.activityKey, assistantId: snap.lastAssistant?.id, afterUserTurnId: snap.afterUserTurnId });
+      await saveSession({ evidence, receipt });
       const assistantKey = snap.assistantKey;
       const observationKey = snap.observationKey;
       // Count each failed assistant turn once, even across reloads. A completed
@@ -880,7 +934,7 @@
           candidateSeenAt,
           status: snap.generating ? "generating" : "settling",
           detail: snap.generating
-            ? "翻訳中です…"
+            ? "画面は応答中です。実際の進行は別に確認します。"
             : snap.retryableSendFailure
               ? `再開依頼の送信失敗を検出しました。${config.deliveryTimeoutSeconds}秒後にRetryします…`
               : snap.streamCacheFailure
@@ -900,9 +954,15 @@
         capacityLimited: snap.capacityLimited,
         rolloverEnabled: config.rolloverEnabled,
         projectSlug: route.projectSlug,
-        completed: snap.completed,
+        completed: snap.completed || session.completionConfirmed,
+        evidence: session.evidence,
+        receipt: session.receipt,
+        nextRecoveryAt: session.nextRecoveryAt,
+        awaitingApproval: snap.awaitingHuman,
+        now: Date.now(),
         terminalErrorBlocked: snap.terminalErrorBlocked,
         stopOnTerminalError: config.stopOnTerminalError,
+        observationKey: snap.observationKey,
         generating: snap.generating,
         interrupted: snap.interrupted,
         deliveryTimedOut: snap.deliveryTimedOut,
@@ -929,6 +989,7 @@
         assistantKey,
         lastHandledAssistantKey: session.lastHandledAssistantKey,
         nudgeCount: session.nudgeCount,
+        rolloverCount: session.rolloverCount,
         maxNudges: config.maxNudges,
         stableForMs: candidateSeenAt ? Date.now() - candidateSeenAt : 0,
         settleMs: config.settleSeconds * 1000,
@@ -936,29 +997,8 @@
         deliveryTimeoutMs: config.deliveryTimeoutSeconds * 1000
       });
 
-      if (decision.action === "recover_stuck") {
-        const stuckContext = decision.reason === "delivery_timeout_stuck_generating"
-          ? "配信タイムアウト後"
-          : "応答中表示のまま";
-        const nextDetail = `${stuckContext}、本文・ツール履歴が${config.silentStallSeconds}秒間変わりません。固着した応答を停止し、労い＋再開依頼を自動送信します👏🍵`;
-        await saveSession({
-          status: "stuck_timeout",
-          detail: nextDetail,
-          candidateSeenAt: Date.now()
-        });
-        await recoverStuckResponse();
-        return;
-      }
-      if (decision.action === "stop_for_runtime_rollover") {
-        const stopButton = findGeneratingButton();
-        if (!stopButton || !snapshot().runtimeFailure) {
-          throw new Error("連続したツール失敗の表示が変わりました。操作せず画面を確認してください。");
-        }
-        stopButton.click();
-        if (!await waitFor(() => !findGeneratingButton(), 8000, 150)) {
-          throw new Error("応答の停止を確認できませんでした。新スレは作成していません。");
-        }
-        await beginRollover("tool_runtime_failure");
+      if (decision.action === "review") {
+        await saveSession({ status: "stuck_timeout", detail: "画面に変化がありません。裏の処理は未確認です。停止せず送れるか確認し、停止が必要なら個別に承認してください。" });
         return;
       }
       if (decision.action === "retry_failed_submission") {
@@ -975,24 +1015,8 @@
         return;
       }
       if (decision.action === "complete") {
-        await saveSession({
-          enabled: false,
-          status: "complete",
-          completionThanksSent: false,
-          detail: "完了合図を確認しました。最後の労いを送って終了します🍻"
-        });
-        try {
-          await submitPrompt(config.completionPrompt);
-          await saveSession({
-            completionThanksSent: true,
-            detail: "完訳を労うメッセージを送り、監視を終了しました🍻🎉"
-          });
-        } catch (error) {
-          await saveSession({
-            status: "error",
-            detail: `翻訳完了は確認しましたが、最後の労いは送信確認できませんでした：${String(error?.message || error)}`
-          });
-        }
+        await saveSession({ enabled: false, completionConfirmed: true, status: "complete",
+          detail: "完了を確認しました。古い応答中表示が残っていても、停止・再開・引き継ぎはしません。おつかれさまでした🍻" });
         return;
       }
       if (decision.action === "thank_and_stop") {
@@ -1026,13 +1050,26 @@
             : decision.reason === "runtime_failure_draft_protected"
               ? "ツール環境が連続して失敗しました。入力欄に下書きがあるため、自動引き継ぎを停止しました。"
               : decision.reason === "repeated_tool_runtime_failure"
-                ? "ツール環境が連続して失敗しました。自動引き継ぎは1回までです。GitHubの保存済み状態を確認してください。"
+                ? "ツール環境が連続して失敗しました。自動停止・移動はせず、GitHubの保存済み状態と実際のツール確認が必要です。"
                 : "容量上限を検知しましたが、安全なプロジェクト内引き継ぎ先を確認できませんでした。"
         });
         return;
       }
       if (decision.action === "nudge") {
         await nudgeNow(snap.assistantKey);
+        return;
+      }
+
+      const evidenceWait = {
+        evidence_read_failed: "保存状態の読み取りに失敗しました。進行・停止は不明のため操作しません。",
+        saved_state_unknown: "画面だけでは停止を確認できません。GitHubの保存状態を確認してください。",
+        recent_actual_activity: "実際の出力・保存の進行を確認しました。画面が止まって見えても待ちます。",
+        execution_unverified: "依頼の画面表示・保存と実行は別です。実行未確認のため再送しません。",
+        recovery_backoff: "連続した再開依頼を避けるため、間隔を空けて待っています。",
+        human_action_required: "承認・ログイン待ちです。自動続行しません。"
+      }[decision.reason];
+      if (evidenceWait) {
+        if (session.detail !== evidenceWait) await saveSession({ status: "waiting", detail: evidenceWait });
         return;
       }
 
@@ -1076,7 +1113,7 @@
         const nextStatus = snap.interrupted ? "interrupted" : "generating";
         const nextDetail = snap.interrupted
           ? "接続中断表示です。ChatGPTが応答中扱いのため、安全のため停止ボタンは押さず待っています。"
-          : "翻訳中です…";
+          : "画面は応答中です。実際の進行は別に確認します。";
         if (session.status !== nextStatus || session.detail !== nextDetail) {
           await saveSession({ status: nextStatus, detail: nextDetail });
         }
@@ -1118,6 +1155,7 @@
       config,
       session,
       snapshot: snap ? {
+        observationKey: snap.observationKey,
         generating: snap.generating,
         interrupted: snap.interrupted,
         deliveryTimedOut: snap.deliveryTimedOut,
@@ -1139,6 +1177,9 @@
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const run = async () => {
+      if (tickRunning || commandRunning) throw new Error("状態の確認・操作中です。少し待ってください。");
+      commandRunning = true;
+      try {
       switch (message?.type) {
         case "GET_STATUS":
           await loadState();
@@ -1156,11 +1197,19 @@
           return nudgeNow();
         case "RECOVER_STUCK_TIMEOUT":
           if (message.config) await saveConfig(message.config);
-          return recoverStuckResponse();
+          return recoverStuckResponse(message.authorization);
         case "ROLLOVER_NOW":
           if (message.config) await saveConfig(message.config);
           await beginRollover("manual");
           return { ok: true };
+        case "RECORD_EVIDENCE": {
+          if (message.sessionKey !== route.sessionKey) throw new Error("対象の会話が変わりました。");
+          const evidence = core.updateEvidence(session.evidence, message.evidence);
+          if (evidence === session.evidence) throw new Error("観察時刻が不正または古い記録です。");
+          await saveSession({ evidence,
+            ...(evidence.manifestStatus === "complete" ? { completionConfirmed: true, enabled: false, status: "complete", detail: "保存済み完了の確認を記録しました。再開しません。" } : {}) });
+          return statusPayload();
+        }
         case "RESET_COUNT":
           await saveSession({ nudgeCount: 0, runtimeFailureStreak: 0,
             runtimeFailureTurnKey: null, runtimeRolloverCount: 0,
@@ -1169,6 +1218,7 @@
         default:
           return { ok: false, error: "unknown_message" };
       }
+      } finally { commandRunning = false; }
     };
 
     run()
@@ -1195,3 +1245,4 @@
     updateBadge("error");
   });
 })();
+
